@@ -36,6 +36,6 @@ func NewAnthropic(opts ...Option) (anthropic.Client, error) {
 		option.WithRequestTimeout(defaultChatTimeout()),
 		option.WithBaseURL(cfg.apiURL),
 		option.WithAPIKey(cfg.apiKey),
-		option.WithMiddleware(x402Middleware(sign)),
+		option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())),
 	), nil
 }

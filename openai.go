@@ -35,6 +35,6 @@ func NewOpenAI(opts ...Option) (openai.Client, error) {
 		// /v1/messages itself, so its base stays /api).
 		option.WithBaseURL(cfg.apiURL+"/v1"),
 		option.WithAPIKey(cfg.apiKey),
-		option.WithMiddleware(x402Middleware(sign)),
+		option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())),
 	), nil
 }

@@ -64,6 +64,8 @@ type config struct {
 	privHex      string // optional explicit wallet key (Base hex or Solana bs58); empty means auto-load
 	chain        string // "base" (default) or "solana"
 	solanaRPCURL string // optional Solana RPC override (blockhash + mint info)
+	facilitator  string // x402 facilitator preference ("figment" default on Solana; "payai" opts out)
+	solanaAddr   string // derived bs58 wallet address (Solana only), for x-payer-wallet
 }
 
 // Option customises a VIP client.
@@ -104,8 +106,35 @@ func WithAPIKey(key string) Option {
 	return func(c *config) { c.apiKey = key }
 }
 
+// WithFacilitator sets the x402 facilitator preference sent to the gateway
+// (Solana only). VIP clients default to "figment" — the gateway routes
+// allowlisted enterprise wallets through the Figment facilitator and silently
+// keeps everyone else on PayAI, so the default is safe for non-allowlisted
+// wallets. Pass "payai" to opt out entirely (no routing headers sent). The
+// BLOCKRUN_FACILITATOR env var overrides the default when no explicit option
+// is given.
+func WithFacilitator(name string) Option {
+	return func(c *config) { c.facilitator = name }
+}
+
 // isSolana reports whether the resolved config pays on Solana.
 func (c config) isSolana() bool { return c.chain == chainSolana }
+
+// paymentRoutingHeaders returns the facilitator-routing headers attached to
+// every gateway request (Solana + non-payai preference only; nil otherwise, so
+// the wire is byte-identical to older releases for Base and opted-out clients).
+// The gateway treats these as a ROUTING HINT: non-allowlisted wallets fall
+// back to PayAI silently, and the money gate is the gateway's verify-time
+// check against the facilitator-established payer, not these headers.
+func (c config) paymentRoutingHeaders() map[string]string {
+	if !c.isSolana() || c.facilitator == "" || c.facilitator == "payai" || c.solanaAddr == "" {
+		return nil
+	}
+	return map[string]string{
+		"x-blockrun-facilitator": c.facilitator,
+		"x-payer-wallet":         c.solanaAddr,
+	}
+}
 
 // resolveKey applies options and resolves the wallet key for the selected chain
 // (Base hex or Solana bs58). The media clients reuse blockrun-llm-go's clients,
@@ -138,6 +167,21 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 		}
 		if key == "" {
 			return cfg, "", fmt.Errorf("vip: no Solana wallet key (set SOLANA_WALLET_KEY or ~/.blockrun/.solana-session, or pass WithWalletKey)")
+		}
+		// Facilitator preference (Solana only): explicit option > env > the
+		// "figment" default. The gateway whitelist decides what actually
+		// happens, so defaulting on is a no-op for non-enterprise wallets.
+		if cfg.facilitator == "" {
+			cfg.facilitator = os.Getenv("BLOCKRUN_FACILITATOR")
+		}
+		if cfg.facilitator == "" {
+			cfg.facilitator = "figment"
+		}
+		// The wallet address rides along as x-payer-wallet so the gateway can
+		// whitelist-check BEFORE the 402 challenge (the challenge's feePayer
+		// differs per facilitator, so the split must happen pre-payment).
+		if addr, addrErr := blockrun.GetSolanaPublicKey(key); addrErr == nil {
+			cfg.solanaAddr = addr
 		}
 		return cfg, key, nil
 	}

@@ -71,7 +71,7 @@ func TestX402Middleware_SignsAndRetries(t *testing.T) {
 
 	mw := x402Middleware(func(paymentHeader, requestURL string) (string, error) {
 		return signPayment(priv, paymentHeader, requestURL)
-	})
+	}, nil)
 	next := func(req *http.Request) (*http.Response, error) {
 		return http.DefaultClient.Do(req)
 	}
@@ -113,7 +113,7 @@ func TestX402Middleware_PassthroughOn200(t *testing.T) {
 	priv, _ := blockrun.GetPrivateKeyFromHex(testWalletKey)
 	mw := x402Middleware(func(paymentHeader, requestURL string) (string, error) {
 		return signPayment(priv, paymentHeader, requestURL)
-	})
+	}, nil)
 	next := func(req *http.Request) (*http.Response, error) { return http.DefaultClient.Do(req) }
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewReader([]byte(`{}`)))

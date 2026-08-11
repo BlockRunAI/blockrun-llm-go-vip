@@ -35,8 +35,21 @@ type paymentSigner func(paymentHeader, requestURL string) (string, error)
 //
 // SECURITY: the wallet key is used ONLY for local signing. The key never leaves
 // the machine; only the signature is transmitted.
-func x402Middleware(sign paymentSigner) transportMiddleware {
+//
+// extraHeaders (nil OK) are set on the outgoing request before the first send —
+// the 402 retry is a Clone of that request, so they ride on both legs. Used for
+// facilitator routing (x-blockrun-facilitator / x-payer-wallet), which must be
+// identical on the challenge and the paid retry: the gateway derives the 402's
+// feePayer from them, and the signed transaction only settles through the
+// facilitator that issued that feePayer.
+func x402Middleware(sign paymentSigner, extraHeaders map[string]string) transportMiddleware {
 	return func(req *http.Request, next func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+		for k, v := range extraHeaders {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
+
 		// Buffer the body so the 402 retry can replay it verbatim.
 		var body []byte
 		if req.Body != nil {
