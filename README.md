@@ -295,6 +295,20 @@ The gateway base URL can be overridden via `BLOCKRUN_API_URL` (Base) /
 Because the middleware never reshapes the success response, the official SDK does all
 parsing — that is what makes the passthrough native.
 
+Two failures recover automatically, both bounded, and both only on an explicit
+machine-readable signal from the gateway:
+
+- **Stale blockhash** (`402`) — the signed Solana transaction aged out. It is discarded,
+  never replayed; the whole negotiation re-runs from a fresh quote and a fresh signature.
+- **Verifier unavailable** (`503 PAYMENT_VERIFICATION_UNAVAILABLE`) — the gateway could
+  not run its payer-risk screen and failed closed, so the payment was never judged.
+  The request is retried honouring the server's `Retry-After` (capped at 30s).
+
+Every other response, including any other `503`, is handed to the caller untouched. That
+is deliberate: paid routes settle optimistically, in parallel with the upstream work, so
+an unmarked `503` may arrive *after* the charge — retrying it would buy the same thing
+twice. Recovery is limited to answers the gateway gives before anything is broadcast.
+
 ## Scope
 
 Covers, on **Base** or **Solana** (`vip.WithChain("solana")`):

@@ -590,3 +590,205 @@ func TestX402Middleware_NeverRetriesSettlementFailures(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Verifier-outage recovery (503 PAYMENT_VERIFICATION_UNAVAILABLE)
+//
+// blockrun-sol fails CLOSED when the facilitator's payer-risk screen is down:
+// it cannot judge the payment, so it serves nobody. Before the gateway learned
+// to say so, that surfaced as a terminal 402 "Payment verification failed" —
+// on 2026-08-13 02:00-03:59Z roughly 600 requests from one wallet, which
+// settled 565 times in the hour before the window and 359 in the hour after.
+// Nothing was wrong with the payment and there was nothing for the payer to fix.
+// ---------------------------------------------------------------------------
+
+func unavailableBody() string {
+	return `{"error":"Payment verification temporarily unavailable","message":"Retry the request; the signed payment was not rejected.","code":"PAYMENT_VERIFICATION_UNAVAILABLE","reason":"verification_unavailable"}`
+}
+
+func TestX402Middleware_RecoversFromVerifierOutage(t *testing.T) {
+	var calls, paidLegs int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Header.Get("PAYMENT-SIGNATURE") == "" {
+			w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+			w.WriteHeader(http.StatusPaymentRequired)
+			return
+		}
+		// Screen is down for the first paid leg, recovered for the second.
+		if atomic.AddInt32(&paidLegs, 1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(unavailableBody()))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 after the screen recovers, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&paidLegs); got != 2 {
+		t.Fatalf("want 2 paid legs (outage then success), got %d", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Fatalf("want 4 calls — each retry re-quotes and re-signs, got %d", got)
+	}
+}
+
+func TestX402Middleware_BoundsVerifierOutageRetries(t *testing.T) {
+	var paidLegs int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PAYMENT-SIGNATURE") == "" {
+			w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+			w.WriteHeader(http.StatusPaymentRequired)
+			return
+		}
+		atomic.AddInt32(&paidLegs, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(unavailableBody()))
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// A sustained outage must surface, not be hidden behind an unbounded loop.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("want the 503 to reach the caller, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&paidLegs); got != 3 {
+		t.Fatalf("want 3 paid legs (initial + 2 bounded retries), got %d", got)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != unavailableBody() {
+		t.Fatalf("body not delivered intact:\n got %q\nwant %q", string(got), unavailableBody())
+	}
+}
+
+// THE double-charge guard. Routes settle OPTIMISTICALLY, in parallel with the
+// upstream work, so a 503 raised after settlement has been kicked off means the
+// caller may ALREADY be charged. Retrying that buys the same thing twice. Only
+// the explicit verify-phase marker is recoverable; every other 503 is terminal.
+func TestX402Middleware_DoesNotRetryUnmarkedServiceUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"bare upstream outage", `{"error":"upstream provider unavailable"}`},
+		{"settlement phase", `{"error":"Payment settlement failed","code":"SETTLEMENT_FAILED","reason":"settlement_failed"}`},
+		{"empty body", ``},
+		{"not json", `<html>502 Bad Gateway</html>`},
+		{"different code", `{"code":"PAYMENT_INVALID","reason":"insufficient_funds"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var paidLegs int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("PAYMENT-SIGNATURE") == "" {
+					w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+					w.WriteHeader(http.StatusPaymentRequired)
+					return
+				}
+				atomic.AddInt32(&paidLegs, 1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+				return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+			}, nil, []time.Duration{0}, []time.Duration{0, 0})
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+			resp, err := mw(req, http.DefaultClient.Do)
+			if err != nil {
+				t.Fatalf("middleware error: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if got := atomic.LoadInt32(&paidLegs); got != 1 {
+				t.Fatalf("paid %d times — an unmarked 503 may follow settlement; retrying can double-charge", got)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != tc.body {
+				t.Fatalf("body not delivered intact:\n got %q\nwant %q", string(body), tc.body)
+			}
+		})
+	}
+}
+
+func TestX402Middleware_VerifierOutageRetryHonorsContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PAYMENT-SIGNATURE") == "" {
+			w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+			w.WriteHeader(http.StatusPaymentRequired)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(unavailableBody()))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		cancel() // cancel before the backoff sleep begins
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{time.Hour})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	if _, err := mw(req, http.DefaultClient.Do); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+func TestRetryAfterDelay(t *testing.T) {
+	const fallback = 7 * time.Second
+	for _, tc := range []struct {
+		name   string
+		header string
+		want   time.Duration
+	}{
+		{"gateway jittered value wins", "12", 12 * time.Second},
+		{"zero means immediately, not absent", "0", 0},
+		{"absent falls back", "", fallback},
+		{"whitespace tolerated", "  9 ", 9 * time.Second},
+		// An HTTP-date needs both clocks to agree; a skewed one turns a 5s wait
+		// into hours. The gateway sends seconds, so a date is somebody's proxy.
+		{"http-date ignored", "Wed, 13 Aug 2026 02:30:00 GMT", fallback},
+		{"garbage ignored", "soon", fallback},
+		{"negative ignored", "-5", fallback},
+		{"over cap falls back rather than clamps", "3600", fallback},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{Header: http.Header{}}
+			if tc.header != "" {
+				resp.Header.Set("Retry-After", tc.header)
+			}
+			if got := retryAfterDelay(resp, fallback); got != tc.want {
+				t.Fatalf("retryAfterDelay(%q) = %v, want %v", tc.header, got, tc.want)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,23 @@ type paymentSigner func(paymentHeader, requestURL string) (string, error)
 // gateway challenge to roll over. A stale signed transaction must never be
 // replayed: every recovery attempt below obtains a fresh 402 and re-signs it.
 var staleBlockhashRetryBackoffs = []time.Duration{500 * time.Millisecond, 2 * time.Second}
+
+// unavailableBackoffs bound recovery from a gateway whose payment VERIFIER is
+// down (503 PAYMENT_VERIFICATION_UNAVAILABLE). Fallbacks only — the gateway
+// sends a jittered Retry-After and that value wins when it is sane.
+//
+// Longer than the stale-blockhash backoffs on purpose. A stale blockhash is
+// per-request and clears on the next block; a fail-closed screen is a global
+// dependency outage that every caller hits in the same second, so retrying it
+// fast just adds load to something already down. Two attempts, because past
+// that the caller's own error handling should decide — an outage that outlives
+// ~30s is not one an SDK should hide behind a long silent block.
+var unavailableBackoffs = []time.Duration{2 * time.Second, 8 * time.Second}
+
+// maxRetryAfterDelay caps a server-supplied Retry-After. The header is a hint
+// from a host that is currently malfunctioning; honouring an arbitrary value
+// would let it park a caller's request (and goroutine) for as long as it likes.
+const maxRetryAfterDelay = 30 * time.Second
 
 // x402Middleware builds the native-passthrough payment middleware.
 //
@@ -63,7 +81,20 @@ func x402Middleware(sign paymentSigner, extraHeaders map[string]string) transpor
 
 // x402MiddlewareWithBackoffs exists so the retry state machine can be tested
 // deterministically without sleeping. Production callers use x402Middleware.
+// Verifier-outage recovery keeps its production schedule here; tests that need
+// it fast use x402MiddlewareWithAllBackoffs.
 func x402MiddlewareWithBackoffs(sign paymentSigner, extraHeaders map[string]string, staleBackoffs []time.Duration) transportMiddleware {
+	return x402MiddlewareWithAllBackoffs(sign, extraHeaders, staleBackoffs, unavailableBackoffs)
+}
+
+// x402MiddlewareWithAllBackoffs is the full test seam: both recovery loops'
+// schedules are injectable.
+func x402MiddlewareWithAllBackoffs(
+	sign paymentSigner,
+	extraHeaders map[string]string,
+	staleBackoffs []time.Duration,
+	unavailableBackoffs []time.Duration,
+) transportMiddleware {
 	return func(req *http.Request, next func(*http.Request) (*http.Response, error)) (*http.Response, error) {
 		for k, v := range extraHeaders {
 			if req.Header.Get(k) == "" {
@@ -100,7 +131,7 @@ func x402MiddlewareWithBackoffs(sign paymentSigner, extraHeaders map[string]stri
 			return attempt
 		}
 
-		for staleRetries := 0; ; {
+		for staleRetries, unavailableRetries := 0, 0; ; {
 			// Always begin a payment attempt without a signature. This obtains a
 			// fresh challenge instead of replaying a transaction whose blockhash
 			// the verifier has already rejected.
@@ -128,6 +159,23 @@ func x402MiddlewareWithBackoffs(sign paymentSigner, extraHeaders map[string]stri
 			if err != nil {
 				return paidResp, err
 			}
+
+			// The gateway could not RUN its verifier — its risk screen was down,
+			// so the signed payment was never judged, let alone charged. Observed
+			// in blockrun-sol production on 2026-08-13 02:00-03:59Z: ~600 requests
+			// from one wallet, which settled 565 times in the hour before and 359
+			// in the hour after. Without this the caller gets a bare 503 and the
+			// gateway's Retry-After is read by nobody.
+			if isVerificationUnavailableResponse(paidResp) && unavailableRetries < len(unavailableBackoffs) {
+				delay := retryAfterDelay(paidResp, unavailableBackoffs[unavailableRetries])
+				_ = paidResp.Body.Close()
+				if err := waitForX402Retry(req, delay); err != nil {
+					return nil, err
+				}
+				unavailableRetries++
+				continue
+			}
+
 			if paidResp.StatusCode != http.StatusPaymentRequired ||
 				!isStaleBlockhashResponse(paidResp) ||
 				staleRetries >= len(staleBackoffs) {
@@ -234,6 +282,75 @@ func isStaleBlockhashResponse(resp *http.Response) bool {
 		strings.Contains(detail, "blockhashnotfound") ||
 		strings.Contains(detail, "blockheightexceeded") ||
 		(verifyPhase && (reason == "expiredsignature" || strings.Contains(message, "expiredsignature")))
+}
+
+// isVerificationUnavailableResponse recognizes the one failure where the gateway
+// never judged the payment at all: a required verification dependency (the
+// facilitator's payer-risk screen) was down and it failed closed.
+//
+// Retrying is safe here for the same reason the stale-blockhash path is safe,
+// and only for that reason: this is a VERIFY-phase answer, returned before any
+// transaction is broadcast, so no retry can pay twice. That is also why a bare
+// 503 is not enough. 503 is the generic "something upstream is unwell", and the
+// routes settle OPTIMISTICALLY — a 503 raised after settlement has already been
+// kicked off would, if retried, buy the same thing again. So this requires the
+// explicit machine-readable marker the gateway emits for this case
+// (blockrun-sol lib/payment-unavailable-response.ts) and nothing looser:
+//
+//	503 {"code":"PAYMENT_VERIFICATION_UNAVAILABLE","reason":"verification_unavailable"}
+//
+// Same body-restoring contract as isStaleBlockhashResponse: an unrecognized 503
+// reaches the caller byte-for-byte.
+func isVerificationUnavailableResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	original := resp.Body
+	body, err := io.ReadAll(io.LimitReader(original, maxStaleClassifyBytes+1))
+	resp.Body = &prefixedBody{r: io.MultiReader(bytes.NewReader(body), original), c: original}
+	if err != nil || len(body) > maxStaleClassifyBytes {
+		return false
+	}
+
+	var failure struct {
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(body, &failure) != nil {
+		return false
+	}
+	return normalizePaymentSignal(failure.Code) == "paymentverificationunavailable" ||
+		normalizePaymentSignal(failure.Reason) == "verificationunavailable"
+}
+
+// retryAfterDelay reads the gateway's Retry-After, falling back to the caller's
+// own backoff when it is absent, unparseable, or implausible.
+//
+// Delta-seconds only. The HTTP-date form is not honoured: it depends on the two
+// clocks agreeing, and a skewed one turns a 5-second wait into hours or into
+// nothing. The gateway sends seconds (jittered 5-15s), so the date form would be
+// somebody else's proxy rewriting the header — a value worth ignoring.
+//
+// 0 is a valid answer meaning "immediately" and is NOT treated as absent; a
+// negative or over-cap value falls back rather than being clamped, since it says
+// the sender is not speaking the same protocol.
+func retryAfterDelay(resp *http.Response, fallback time.Duration) time.Duration {
+	if resp == nil {
+		return fallback
+	}
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if raw == "" {
+		return fallback
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs < 0 {
+		return fallback
+	}
+	d := time.Duration(secs) * time.Second
+	if d > maxRetryAfterDelay {
+		return fallback
+	}
+	return d
 }
 
 // prefixedBody re-presents a response body whose leading bytes were consumed
