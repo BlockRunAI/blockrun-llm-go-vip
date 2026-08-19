@@ -66,6 +66,12 @@ const maxRetryAfterDelay = 30 * time.Second
 // A caller can therefore sign up to len(staleBlockhashRetryBackoffs)+1 distinct
 // payments for one request, each against a server-supplied quote.
 //
+// The unpaid leg has one recovery of its own: if the gateway cannot build a
+// challenge because its facilitator is unreachable (see
+// isChallengeUnavailableResponse), the quote is retried on the same schedule as
+// a verifier outage. Nothing is signed at that point, so it is the one recovery
+// here with no double-charge exposure to reason about.
+//
 // SECURITY: the wallet key is used ONLY for local signing. The key never leaves
 // the machine; only the signature is transmitted.
 //
@@ -140,6 +146,20 @@ func x402MiddlewareWithAllBackoffs(
 				return resp, err
 			}
 			if resp.StatusCode != http.StatusPaymentRequired {
+				// The gateway could not even QUOTE the call, because the
+				// facilitator it must consult to build the challenge was
+				// unreachable. Nothing has been signed at this point, so unlike
+				// every other recovery in this loop, this one carries no
+				// double-charge exposure at all.
+				if isChallengeUnavailableResponse(resp) && unavailableRetries < len(unavailableBackoffs) {
+					delay := retryAfterDelay(resp, unavailableBackoffs[unavailableRetries])
+					_ = resp.Body.Close()
+					if err := waitForX402Retry(req, delay); err != nil {
+						return nil, err
+					}
+					unavailableRetries++
+					continue
+				}
 				// Native passthrough: hand the upstream response back untouched.
 				return resp, nil
 			}
@@ -321,6 +341,54 @@ func isVerificationUnavailableResponse(resp *http.Response) bool {
 	}
 	return normalizePaymentSignal(failure.Code) == "paymentverificationunavailable" ||
 		normalizePaymentSignal(failure.Reason) == "verificationunavailable"
+}
+
+// isChallengeUnavailableResponse recognizes a gateway that could not produce a
+// payment challenge because the facilitator it depends on was unreachable. It
+// is consulted ONLY on the unpaid leg.
+//
+// It is deliberately wider than isVerificationUnavailableResponse, for a
+// structural reason rather than a matter of taste. Everything that pins the
+// paid-leg classifier to one exact marker is a double-charge argument: those
+// routes settle optimistically, so a loose match there could replay a payment
+// the caller already made. Before signing there is no authorization in flight,
+// so no retry can buy anything twice. All that remains to weigh is whether a
+// retry is useful, and against a facilitator outage it is.
+//
+// Two shapes qualify — the marker the gateway is supposed to send, and what
+// production actually sent during a facilitator outage at 33 req/s on
+// 2026-08-19 03:22:56-58Z, where it reported a failed dependency as its own
+// internal error:
+//
+//	503 {"code":"PAYMENT_VERIFICATION_UNAVAILABLE","reason":"verification_unavailable"}
+//	500 {"code":"INTERNAL_ERROR","debug":"Facilitator /supported returned 503"}
+//
+// Matching the second on `debug` is a bridge, not a contract: it is the only
+// field naming the failing dependency, and it should be deleted once
+// blockrun-sol maps a facilitator outage onto the 503 marker above. A 500
+// WITHOUT that field stays terminal on purpose — retrying every 5xx would park
+// a caller for ~10s on deterministic failures like an unknown model id.
+func isChallengeUnavailableResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil || resp.StatusCode < http.StatusInternalServerError {
+		return false
+	}
+	if isVerificationUnavailableResponse(resp) {
+		return true
+	}
+	original := resp.Body
+	body, err := io.ReadAll(io.LimitReader(original, maxStaleClassifyBytes+1))
+	resp.Body = &prefixedBody{r: io.MultiReader(bytes.NewReader(body), original), c: original}
+	if err != nil || len(body) > maxStaleClassifyBytes {
+		return false
+	}
+
+	var failure struct {
+		Debug string `json:"debug"`
+	}
+	if json.Unmarshal(body, &failure) != nil {
+		return false
+	}
+	return strings.Contains(normalizePaymentSignal(failure.Debug), "facilitator")
 }
 
 // retryAfterDelay reads the gateway's Retry-After, falling back to the caller's

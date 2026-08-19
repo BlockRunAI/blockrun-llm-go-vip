@@ -792,3 +792,250 @@ func TestRetryAfterDelay(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Challenge-leg facilitator outage
+//
+// Observed in a 2026-08-19 load test of sol.blockrun.ai at 33.3 req/s: inside a
+// ~1.7s window the gateway could not reach the facilitator at all, and the
+// UNPAID quote request came back 500 INTERNAL_ERROR with debug "Facilitator
+// /supported returned 503". The verifier-outage recovery above never saw it,
+// because that only inspects the PAID leg and only accepts a 503.
+//
+// The double-charge reasoning that keeps the paid-leg classifier narrow does
+// not apply here at all: on the challenge leg nothing has been signed, so there
+// is no authorization in flight that a retry could buy twice.
+// ---------------------------------------------------------------------------
+
+func facilitatorOutageBody() string {
+	return `{"error":"Unexpected error","message":"Message @bc1max on Telegram for help.","code":"INTERNAL_ERROR","debug":"Facilitator /supported returned 503"}`
+}
+
+func TestX402Middleware_RecoversFromFacilitatorOutageOnChallengeLeg(t *testing.T) {
+	var challenges, paidLegs int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PAYMENT-SIGNATURE") != "" {
+			atomic.AddInt32(&paidLegs, 1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		// The facilitator is unreachable for the first quote, back for the second.
+		if atomic.AddInt32(&challenges, 1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(facilitatorOutageBody()))
+			return
+		}
+		w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+		w.WriteHeader(http.StatusPaymentRequired)
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 once the facilitator is reachable again, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&challenges); got != 2 {
+		t.Fatalf("want 2 quote attempts (outage then success), got %d", got)
+	}
+	if got := atomic.LoadInt32(&paidLegs); got != 1 {
+		t.Fatalf("want exactly 1 payment for one logical call, got %d", got)
+	}
+}
+
+// The gateway's correct envelope for this failure is a 503 with the same marker
+// the paid leg already understands. Recovery must not depend on which of the
+// two shapes the gateway happens to emit.
+func TestX402Middleware_RecoversFromMarkedUnavailableOnChallengeLeg(t *testing.T) {
+	var challenges int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PAYMENT-SIGNATURE") != "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		if atomic.AddInt32(&challenges, 1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(unavailableBody()))
+			return
+		}
+		w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+		w.WriteHeader(http.StatusPaymentRequired)
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 once the verifier is back, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&challenges); got != 2 {
+		t.Fatalf("want 2 quote attempts, got %d", got)
+	}
+}
+
+func TestX402Middleware_BoundsChallengeLegOutageRetries(t *testing.T) {
+	var challenges int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&challenges, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(facilitatorOutageBody()))
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// A sustained outage must surface, not be hidden behind an unbounded loop.
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("want the 500 to reach the caller, got %d", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&challenges); got != 3 {
+		t.Fatalf("want 3 quote attempts (initial + 2 bounded retries), got %d", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != facilitatorOutageBody() {
+		t.Fatalf("body not delivered intact:\n got %q\nwant %q", string(body), facilitatorOutageBody())
+	}
+}
+
+// The challenge leg is cheap to retry, not free. A 5xx the gateway raised for
+// its own reasons is not a facilitator outage, and silently retrying it buys
+// the caller a 10s stall before the same error.
+func TestX402Middleware_DoesNotRetryUnrelatedChallengeLegErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"unmarked internal error", http.StatusInternalServerError, `{"error":"Unexpected error","code":"INTERNAL_ERROR"}`},
+		{"bad request", http.StatusBadRequest, `{"error":"model not found","code":"BAD_REQUEST"}`},
+		{"bare bad gateway", http.StatusBadGateway, `<html>502 Bad Gateway</html>`},
+		{"empty body", http.StatusInternalServerError, ``},
+		{"unrelated dependency", http.StatusInternalServerError, `{"code":"INTERNAL_ERROR","debug":"Firestore write failed"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var challenges int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&challenges, 1)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+				return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+			}, nil, []time.Duration{0}, []time.Duration{0, 0})
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+			resp, err := mw(req, http.DefaultClient.Do)
+			if err != nil {
+				t.Fatalf("middleware error: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if got := atomic.LoadInt32(&challenges); got != 1 {
+				t.Fatalf("quoted %d times — this is not a facilitator outage and must pass straight through", got)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if string(body) != tc.body {
+				t.Fatalf("body not delivered intact:\n got %q\nwant %q", string(body), tc.body)
+			}
+		})
+	}
+}
+
+// THE money guard for this change. The same facilitator-outage body is safe to
+// retry BEFORE signing and unsafe AFTER: routes settle optimistically, so a 5xx
+// on the paid leg may arrive with the caller already charged. Widening the
+// challenge-leg classifier must not widen the paid-leg one.
+func TestX402Middleware_DoesNotRetryFacilitatorMarkedErrorOnPaidLeg(t *testing.T) {
+	var paidLegs int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("PAYMENT-SIGNATURE") == "" {
+			w.Header().Set("payment-required", newSolanaRequirement("http://"+r.Host+r.URL.Path, testBlockhashA))
+			w.WriteHeader(http.StatusPaymentRequired)
+			return
+		}
+		atomic.AddInt32(&paidLegs, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(facilitatorOutageBody()))
+	}))
+	defer srv.Close()
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{0, 0})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	resp, err := mw(req, http.DefaultClient.Do)
+	if err != nil {
+		t.Fatalf("middleware error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := atomic.LoadInt32(&paidLegs); got != 1 {
+		t.Fatalf("paid %d times — a 5xx after signing may follow settlement; retrying can double-charge", got)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("want the 500 to reach the caller, got %d", resp.StatusCode)
+	}
+}
+
+func TestX402Middleware_ChallengeOutageRetryHonorsContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(facilitatorOutageBody()))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel strictly AFTER the round trip completes, so the backoff wait is the
+	// only place that can observe it. Cancelling from inside the handler would
+	// pass whether or not a retry exists, by failing the transport instead.
+	next := func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultClient.Do(r)
+		cancel()
+		return resp, err
+	}
+
+	mw := x402MiddlewareWithAllBackoffs(func(paymentHeader, requestURL string) (string, error) {
+		return signSolanaPayment(testSolanaKey, "", paymentHeader, requestURL)
+	}, nil, []time.Duration{0}, []time.Duration{time.Hour})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/chat/completions", bytes.NewReader([]byte(`{"hello":"solana"}`)))
+	if _, err := mw(req, next); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
