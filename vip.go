@@ -61,6 +61,7 @@ const (
 type config struct {
 	apiURL       string
 	apiKey       string
+	apiKeySet    bool
 	privHex      string // optional explicit wallet key (Base hex or Solana bs58); empty means auto-load
 	chain        string // "base" (default) or "solana"
 	solanaRPCURL string // optional Solana RPC override (blockhash + mint info)
@@ -86,7 +87,7 @@ func WithWalletKey(key string) Option {
 	return func(c *config) { c.privHex = key }
 }
 
-// WithChain selects the payment chain: "base" (default, USDC on Base via EIP-712)
+// WithChain explicitly selects the payment chain: "base" (USDC via EIP-712)
 // or "solana" (USDC on Solana via sol.blockrun.ai and the x402 SVM exact scheme).
 // It also switches the default gateway base URL to match the chain.
 func WithChain(chain string) Option {
@@ -100,10 +101,10 @@ func WithSolanaRPCURL(url string) Option {
 	return func(c *config) { c.solanaRPCURL = url }
 }
 
-// WithAPIKey overrides the placeholder upstream API key. Rarely needed —
-// authorization is by x402 payment.
+// WithAPIKey selects account billing without a wallet. Empty/malformed keys
+// are rejected. When omitted, BLOCKRUN_API_KEY selects account mode.
 func WithAPIKey(key string) Option {
-	return func(c *config) { c.apiKey = key }
+	return func(c *config) { c.apiKey = key; c.apiKeySet = true }
 }
 
 // WithFacilitator sets the x402 facilitator preference sent to the gateway
@@ -142,13 +143,30 @@ func (c config) paymentRoutingHeaders() map[string]string {
 func resolveKey(opts ...Option) (cfg config, key string, err error) {
 	cfg = config{
 		apiKey: apiKeySentinel,
-		chain:  chainBase,
+		chain:  "",
 	}
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if cfg.apiKeySet && cfg.privHex != "" {
+		return cfg, "", fmt.Errorf("vip: pass either WithAPIKey or WithWalletKey, not both")
+	}
+	if !cfg.apiKeySet && cfg.privHex == "" {
+		if key, exists := os.LookupEnv("BLOCKRUN_API_KEY"); exists {
+			cfg.apiKey = key
+			cfg.apiKeySet = true
+		}
+	}
+	if cfg.apiKeySet {
+		if !strings.HasPrefix(cfg.apiKey, "brk_live_") || len(cfg.apiKey) <= 9 || strings.ContainsAny(cfg.apiKey, " \n\r\t") {
+			return cfg, "", fmt.Errorf("vip: invalid BlockRun API key; create one at https://user.blockrun.ai/dashboard/keys")
+		}
+		cfg.apiURL, err = accountBase(cfg.apiURL)
+		cfg.chain = "account"
+		return cfg, "", err
+	}
 	if cfg.chain == "" {
-		cfg.chain = chainBase
+		cfg.chain = preferredChain(cfg.privHex)
 	}
 	if cfg.chain != chainBase && cfg.chain != chainSolana {
 		return cfg, "", fmt.Errorf("vip: unknown chain %q (want %q or %q)", cfg.chain, chainBase, chainSolana)
@@ -209,6 +227,9 @@ func resolveSigner(opts ...Option) (cfg config, sign paymentSigner, err error) {
 		return cfg, nil, err
 	}
 
+	if cfg.accountMode() {
+		return cfg, nil, nil
+	}
 	if cfg.isSolana() {
 		rpc := cfg.solanaRPCURL
 		return cfg, func(paymentHeader, requestURL string) (string, error) {

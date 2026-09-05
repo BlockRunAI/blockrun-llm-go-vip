@@ -60,3 +60,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
+
+// Integration pin for P0 SDK PR #28. Replace with its canonical release before publishing.
+replace github.com/BlockRunAI/blockrun-llm-go => github.com/KillerQueen-Z/blockrun-llm-go v0.18.1-0.20260904170517-9417efc0f7d9

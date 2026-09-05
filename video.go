@@ -36,6 +36,7 @@ const (
 //
 // Data[0].URL on the completed job is a permanent BlockRun-hosted MP4.
 type Video struct {
+	accountMode  bool
 	sign         paymentSigner
 	apiURL       string
 	httpClient   *http.Client
@@ -79,10 +80,15 @@ func NewVideo(opts ...Option) (*Video, error) {
 	if err != nil {
 		return nil, err
 	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	if cfg.accountMode() {
+		client = cfg.accountHTTPClient(60 * time.Second)
+	}
 	return &Video{
+		accountMode:  cfg.accountMode(),
 		sign:         sign,
 		apiURL:       cfg.apiURL,
-		httpClient:   &http.Client{Timeout: 60 * time.Second},
+		httpClient:   client,
 		pollInterval: defaultVideoPollInterval,
 		maxWait:      defaultVideoMaxWait,
 	}, nil
@@ -317,6 +323,17 @@ func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte)
 	resp, err := v.httpClient.Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("vip: video request: %w", err)
+	}
+	if v.accountMode {
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, nil, err
+		}
+		if resp.StatusCode >= 400 {
+			return resp.StatusCode, nil, &blockrun.APIError{StatusCode: resp.StatusCode, Message: string(data), RetryAfter: resp.Header.Get("Retry-After")}
+		}
+		return resp.StatusCode, data, nil
 	}
 	if resp.StatusCode != http.StatusPaymentRequired {
 		data, _ := io.ReadAll(resp.Body)

@@ -29,6 +29,9 @@ func NewAnthropic(opts ...Option) (anthropic.Client, error) {
 	if err != nil {
 		return anthropic.Client{}, err
 	}
+	if cfg.accountMode() {
+		return anthropic.NewClient(option.WithRequestTimeout(defaultChatTimeout()), option.WithBaseURL(cfg.apiURL), option.WithAPIKey(apiKeySentinel), option.WithHTTPClient(cfg.accountHTTPClient(0))), nil
+	}
 	return anthropic.NewClient(
 		// Default per-request timeout for reasoning models (200-300s+); set
 		// first so a per-call option.WithRequestTimeout still wins. Override the

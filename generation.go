@@ -78,6 +78,9 @@ func NewImage(opts ...Option) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.accountMode() {
+		return blockrun.NewImageClientWithAPIKey(cfg.apiKey, blockrun.WithImageAPIURL(cfg.apiURL))
+	}
 	if cfg.isSolana() {
 		return blockrun.NewImageClientSolana(key, cfg.solanaRPCURL, blockrun.WithImageAPIURL(cfg.apiURL))
 	}
@@ -95,6 +98,9 @@ func NewSpeech(opts ...Option) (*Speech, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.accountMode() {
+		return blockrun.NewSpeechClientWithAPIKey(cfg.apiKey, blockrun.WithSpeechAPIURL(cfg.apiURL))
+	}
 	if cfg.isSolana() {
 		return blockrun.NewSpeechClientSolana(key, cfg.solanaRPCURL, blockrun.WithSpeechAPIURL(cfg.apiURL))
 	}
@@ -107,6 +113,9 @@ func NewMusic(opts ...Option) (*Music, error) {
 	cfg, key, err := resolveKey(opts...)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.accountMode() {
+		return blockrun.NewMusicClientWithAPIKey(cfg.apiKey, blockrun.WithMusicAPIURL(cfg.apiURL))
 	}
 	if cfg.isSolana() {
 		return blockrun.NewMusicClientSolana(key, cfg.solanaRPCURL, blockrun.WithMusicAPIURL(cfg.apiURL))
@@ -122,6 +131,9 @@ func NewVoice(opts ...Option) (*Voice, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.accountMode() {
+		return blockrun.NewVoiceClientWithAPIKey(cfg.apiKey, blockrun.WithVoiceAPIURL(cfg.apiURL))
+	}
 	if cfg.isSolana() {
 		return blockrun.NewVoiceClientSolana(key, cfg.solanaRPCURL, blockrun.WithVoiceAPIURL(cfg.apiURL))
 	}
@@ -134,6 +146,9 @@ func NewPhone(opts ...Option) (*Phone, error) {
 	cfg, key, err := resolveKey(opts...)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.accountMode() {
+		return blockrun.NewPhoneClientWithAPIKey(cfg.apiKey, blockrun.WithPhoneAPIURL(cfg.apiURL))
 	}
 	if cfg.isSolana() {
 		return blockrun.NewPhoneClientSolana(key, cfg.solanaRPCURL, blockrun.WithPhoneAPIURL(cfg.apiURL))

@@ -93,6 +93,9 @@ func newLLM(opts ...Option) (*blockrun.LLMClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.accountMode() {
+		return blockrun.NewLLMClientWithAPIKey(cfg.apiKey, blockrun.WithAPIURL(cfg.apiURL))
+	}
 	if cfg.isSolana() {
 		return blockrun.NewLLMClientSolana(key, cfg.solanaRPCURL, blockrun.WithAPIURL(cfg.apiURL))
 	}

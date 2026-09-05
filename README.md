@@ -1,7 +1,7 @@
 # blockrun-llm-go-vip
 
 Genuine **native passthrough** for **Anthropic** and **OpenAI** through the BlockRun
-gateway — pay per call in USDC (x402) on **Base** or **Solana**
+gateway — use an **API key**, or pay per call in USDC (x402) on **Solana** or **Base**
 (`vip.WithChain("solana")`), with **zero model substitution and zero response
 reshaping**.
 
@@ -21,6 +21,46 @@ A Claude / OpenAI relay detector sees a direct upstream call.
 This is the Go counterpart of the Python [`blockrun-llm-vip`](../blockrun-llm-vip) package,
 reusing the x402 signing and wallet loading from
 [`blockrun-llm-go`](../blockrun-llm-go).
+
+## Account API
+
+Register at [user.blockrun.ai](https://user.blockrun.ai), create an
+[API key](https://user.blockrun.ai/dashboard/keys), and add
+[account credit](https://user.blockrun.ai/dashboard/credits).
+
+```bash
+export BLOCKRUN_API_KEY=brk_live_...
+```
+
+```go
+client, err := vip.NewOpenAI() // no wallet required
+// Explicit form, accepted by all constructors:
+client, err = vip.NewOpenAI(vip.WithAPIKey("brk_live_..."))
+```
+
+OpenAI/Anthropic native clients, Image/Speech/Music/Video, Voice/Phone,
+Search/Exa and RealFace/Portrait share account authentication. Media submission
+and polling use the same key; no x402 signing or wallet fallback occurs on
+account errors. The root defaults to `https://api.blockrun.ai` and accepts
+`WithBaseURL` or `BLOCKRUN_API_BASE_URL` (trailing `/v1` is normalized). Credentials
+are restricted to that origin and redirects are disabled. Account billing is
+reported in the portal; wallet-owned asset lists still require a wallet.
+
+`WithAPIKey` plus `WithWalletKey` is rejected. An explicit wallet key overrides
+an environment API key. Without account credentials, explicit/saved wallet
+choices and existing Base-only wallets are retained; otherwise Solana is
+preferred. Chain/facilitator options do not select a billing chain in account mode.
+
+This review branch depends on [main Go SDK PR #28](https://github.com/BlockRunAI/blockrun-llm-go/pull/28).
+Its `go.mod` pins the tested SDK commit with a temporary replacement. **Do not
+publish this VIP change until the main SDK is released and this replacement is
+removed in favor of the canonical released version.** Go dependencies do not
+inherit a dependency's `replace` directive; applications testing this branch
+must apply the same explicit replacement in their own `go.mod`.
+
+Production Responses streaming and video polling acceptance also require
+Enterprise PR #10 deployment and video signing-secret provisioning. Local
+protocol tests cover these paths; this is not a claim they are already live.
 
 ## Install
 
@@ -222,11 +262,10 @@ fmt.Println(status)
 
 ```go
 vip.NewAnthropic(
-    vip.WithChain("solana"),                     // "base" (default) or "solana"
+    vip.WithChain("solana"),                     // explicit wallet chain
     vip.WithWalletKey("..."),                    // explicit key (Base hex, or bs58 on Solana)
     vip.WithBaseURL("https://blockrun.ai/api"),  // override the gateway
     vip.WithSolanaRPCURL("https://..."),         // override the Solana RPC (Solana only)
-    vip.WithAPIKey("blockrun"),                  // placeholder upstream key
     vip.WithFacilitator("payai"),                // facilitator preference (Solana only; default "figment")
 )
 ```

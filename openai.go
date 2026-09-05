@@ -25,6 +25,9 @@ func NewOpenAI(opts ...Option) (openai.Client, error) {
 	if err != nil {
 		return openai.Client{}, err
 	}
+	if cfg.accountMode() {
+		return openai.NewClient(option.WithRequestTimeout(defaultChatTimeout()), option.WithBaseURL(cfg.apiURL+"/v1"), option.WithAPIKey(apiKeySentinel), option.WithHTTPClient(cfg.accountHTTPClient(0))), nil
+	}
 	return openai.NewClient(
 		// Default per-request timeout for reasoning models (200-300s+); set
 		// first so a per-call option.WithRequestTimeout still wins. Override the
