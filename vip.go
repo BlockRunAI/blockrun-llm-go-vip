@@ -28,6 +28,22 @@ import (
 // key, so we supply a placeholder rather than leak any real provider key.
 const apiKeySentinel = "blockrun"
 
+// DefaultAccountAPIURL is the BlockRun account gateway — the endpoint that
+// authenticates with an account API key (brk_live_…) and bills the account's
+// prepaid credit instead of settling USDC per call. It serves the chat routes
+// only; media and search stay on the wallet gateway.
+const DefaultAccountAPIURL = "https://api.blockrun.ai"
+
+// accountKeyPrefix marks a BlockRun account API key ("brk_live_…"). Any other
+// value passed to WithAPIKey is treated as a plain upstream-key override and
+// leaves the x402 wallet path untouched.
+const accountKeyPrefix = "brk_"
+
+// isAccountKey reports whether key is a BlockRun account API key.
+func isAccountKey(key string) bool {
+	return strings.HasPrefix(key, accountKeyPrefix)
+}
+
 // DefaultChatTimeout is the default per-request timeout applied to the
 // passthrough chat clients (NewOpenAI / NewAnthropic).
 //
@@ -63,6 +79,7 @@ type config struct {
 	apiKey       string
 	privHex      string // optional explicit wallet key (Base hex or Solana bs58); empty means auto-load
 	chain        string // "base" (default) or "solana"
+	chainSet     bool   // true when WithChain was passed explicitly
 	solanaRPCURL string // optional Solana RPC override (blockhash + mint info)
 	facilitator  string // x402 facilitator preference ("figment" default on Solana; "payai" opts out)
 	solanaAddr   string // derived bs58 wallet address (Solana only), for x-payer-wallet
@@ -90,7 +107,10 @@ func WithWalletKey(key string) Option {
 // or "solana" (USDC on Solana via sol.blockrun.ai and the x402 SVM exact scheme).
 // It also switches the default gateway base URL to match the chain.
 func WithChain(chain string) Option {
-	return func(c *config) { c.chain = chain }
+	return func(c *config) {
+		c.chain = chain
+		c.chainSet = true
+	}
 }
 
 // WithSolanaRPCURL overrides the Solana JSON-RPC endpoint used while signing (to
@@ -100,8 +120,16 @@ func WithSolanaRPCURL(url string) Option {
 	return func(c *config) { c.solanaRPCURL = url }
 }
 
-// WithAPIKey overrides the placeholder upstream API key. Rarely needed —
-// authorization is by x402 payment.
+// WithAPIKey sets the API key sent upstream.
+//
+// A BlockRun account API key ("brk_live_…") switches the client into account
+// mode: requests go to DefaultAccountAPIURL, the account's prepaid credit pays,
+// and no wallet is loaded or signed with. BLOCKRUN_API_KEY selects the same
+// mode for NewAnthropic / NewOpenAI when no key is passed explicitly.
+//
+// Any other value is just a placeholder override for the upstream key and
+// changes nothing about payment — the x402 wallet path still authorizes the
+// call. Rarely needed there.
 func WithAPIKey(key string) Option {
 	return func(c *config) { c.apiKey = key }
 }
@@ -120,6 +148,10 @@ func WithFacilitator(name string) Option {
 // isSolana reports whether the resolved config pays on Solana.
 func (c config) isSolana() bool { return c.chain == chainSolana }
 
+// usesAccountKey reports whether the resolved config pays from BlockRun account
+// credit (API key) rather than by signing an x402 payment from a wallet.
+func (c config) usesAccountKey() bool { return isAccountKey(c.apiKey) }
+
 // paymentRoutingHeaders returns the facilitator-routing headers attached to
 // every gateway request (Solana + non-payai preference only; nil otherwise, so
 // the wire is byte-identical to older releases for Base and opted-out clients).
@@ -136,30 +168,75 @@ func (c config) paymentRoutingHeaders() map[string]string {
 	}
 }
 
-// resolveKey applies options and resolves the wallet key for the selected chain
-// (Base hex or Solana bs58). The media clients reuse blockrun-llm-go's clients,
-// which take the key directly.
-func resolveKey(opts ...Option) (cfg config, key string, err error) {
-	cfg = config{
+// resolveConfig applies the options and resolves the payment mode and gateway
+// URL. It never touches the wallet — the caller decides whether one is needed.
+//
+// Two modes exist. The default is x402: a wallet signs a USDC payment per call
+// against blockrun.ai (Base) or sol.blockrun.ai (Solana). The second is account
+// mode, selected by a BlockRun account API key (brk_live_…): the account's
+// prepaid credit pays, requests go to DefaultAccountAPIURL, and no wallet is
+// involved at all.
+//
+// acceptEnvKey allows BLOCKRUN_API_KEY to select account mode. The chat
+// constructors pass true; the wallet-only clients (media, video, search) pass
+// false, so a key exported in the environment for an unrelated client cannot
+// silently break a media call that has always paid from a wallet.
+func resolveConfig(acceptEnvKey bool, opts ...Option) (config, error) {
+	cfg := config{
 		apiKey: apiKeySentinel,
 		chain:  chainBase,
 	}
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if acceptEnvKey && !cfg.usesAccountKey() && (cfg.apiKey == "" || cfg.apiKey == apiKeySentinel) {
+		if env := strings.TrimSpace(os.Getenv("BLOCKRUN_API_KEY")); isAccountKey(env) {
+			cfg.apiKey = env
+		}
+	}
+	if cfg.apiKey == "" {
+		cfg.apiKey = apiKeySentinel
+	}
+
+	if cfg.usesAccountKey() {
+		// These options describe an on-chain payment this mode never makes.
+		// Failing loudly beats silently ignoring a caller who believes they
+		// are paying from the wallet they named.
+		if cfg.chainSet {
+			return cfg, fmt.Errorf("vip: WithChain is meaningless with a BlockRun account API key (%s…) — account credit pays and nothing settles on-chain; drop one of the two", accountKeyPrefix)
+		}
+		if cfg.privHex != "" {
+			return cfg, fmt.Errorf("vip: WithWalletKey is meaningless with a BlockRun account API key (%s…) — account credit pays and the wallet is never signed with; drop one of the two", accountKeyPrefix)
+		}
+		if cfg.apiURL == "" {
+			cfg.apiURL = DefaultAccountAPIURL
+		}
+		return cfg, nil
+	}
+
 	if cfg.chain == "" {
 		cfg.chain = chainBase
 	}
 	if cfg.chain != chainBase && cfg.chain != chainSolana {
-		return cfg, "", fmt.Errorf("vip: unknown chain %q (want %q or %q)", cfg.chain, chainBase, chainSolana)
+		return cfg, fmt.Errorf("vip: unknown chain %q (want %q or %q)", cfg.chain, chainBase, chainSolana)
 	}
-
-	if cfg.isSolana() {
-		if cfg.apiURL == "" {
+	if cfg.apiURL == "" {
+		if cfg.isSolana() {
 			cfg.apiURL = blockrun.DefaultSolanaAPIURL
+		} else {
+			cfg.apiURL = blockrun.DefaultAPIURL
 		}
-		key = cfg.privHex
+	}
+	return cfg, nil
+}
+
+// loadWalletKey resolves the x402 wallet key for the resolved chain (Base hex
+// or Solana bs58) and fills in the Solana-only routing fields.
+func loadWalletKey(cfg config) (config, string, error) {
+	if cfg.isSolana() {
+		key := cfg.privHex
 		if key == "" {
+			var err error
 			key, err = blockrun.LoadSolanaWallet()
 			if err != nil {
 				return cfg, "", fmt.Errorf("vip: failed to load Solana wallet: %w", err)
@@ -186,11 +263,9 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 		return cfg, key, nil
 	}
 
-	if cfg.apiURL == "" {
-		cfg.apiURL = blockrun.DefaultAPIURL
-	}
-	key = cfg.privHex
+	key := cfg.privHex
 	if key == "" {
+		var err error
 		key, err = blockrun.LoadWallet()
 		if err != nil {
 			return cfg, "", fmt.Errorf("vip: no wallet key (set BLOCKRUN_WALLET_KEY or ~/.blockrun/.session, or pass WithWalletKey): %w", err)
@@ -199,12 +274,37 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 	return cfg, key, nil
 }
 
-// resolveSigner applies options, resolves the wallet key, and returns a
-// chain-aware x402 payment signer for the passthrough middleware and native
-// Video client. Base signs EIP-712 (secp256k1); Solana signs the SVM exact scheme
-// (ed25519).
+// resolveKey applies options and resolves the wallet key for the selected chain
+// (Base hex or Solana bs58). The media clients reuse blockrun-llm-go's clients,
+// which take the key directly — they always settle on-chain, so an account API
+// key is rejected here rather than sent to a gateway that would 402 it.
+func resolveKey(opts ...Option) (cfg config, key string, err error) {
+	cfg, err = resolveConfig(false, opts...)
+	if err != nil {
+		return cfg, "", err
+	}
+	if cfg.usesAccountKey() {
+		return cfg, "", fmt.Errorf("vip: a BlockRun account API key (%s…) pays for the chat routes only — image, video, speech, music, RealFace and search settle on-chain, so this client needs a wallet; drop WithAPIKey here", accountKeyPrefix)
+	}
+	return loadWalletKey(cfg)
+}
+
+// resolveSigner applies options and returns a chain-aware x402 payment signer
+// for the passthrough middleware and native Video client. Base signs EIP-712
+// (secp256k1); Solana signs the SVM exact scheme (ed25519).
+//
+// In account mode (BlockRun API key) the returned signer is nil: the account's
+// credit pays, so there is no payment to sign and no wallet to load.
 func resolveSigner(opts ...Option) (cfg config, sign paymentSigner, err error) {
-	cfg, key, err := resolveKey(opts...)
+	cfg, err = resolveConfig(true, opts...)
+	if err != nil {
+		return cfg, nil, err
+	}
+	if cfg.usesAccountKey() {
+		return cfg, nil, nil
+	}
+
+	cfg, key, err := loadWalletKey(cfg)
 	if err != nil {
 		return cfg, nil, err
 	}

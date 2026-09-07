@@ -226,12 +226,48 @@ vip.NewAnthropic(
     vip.WithWalletKey("..."),                    // explicit key (Base hex, or bs58 on Solana)
     vip.WithBaseURL("https://blockrun.ai/api"),  // override the gateway
     vip.WithSolanaRPCURL("https://..."),         // override the Solana RPC (Solana only)
-    vip.WithAPIKey("blockrun"),                  // placeholder upstream key
+    vip.WithAPIKey("brk_live_..."),              // BlockRun account key → account mode (below)
     vip.WithFacilitator("payai"),                // facilitator preference (Solana only; default "figment")
 )
 ```
 
-All options apply to every constructor (`NewOpenAI`, `NewImage`, `NewVideo`, …).
+All options apply to every constructor (`NewOpenAI`, `NewImage`, `NewVideo`, …), except
+`WithAPIKey` with an account key — that one is chat-only (see below).
+
+## API key (account mode, v0.8.0+) — no wallet
+
+Teams that cannot run a wallet can pay from BlockRun **account credit** instead of
+x402. Pass an account API key (`brk_live_…`, from
+[user.blockrun.ai](https://user.blockrun.ai/dashboard/keys)) and the chat clients
+switch to the account gateway `https://api.blockrun.ai`; no wallet is loaded, nothing
+is signed, and no USDC settles on-chain:
+
+```go
+claude, _ := vip.NewAnthropic(vip.WithAPIKey("brk_live_..."))
+gpt, _    := vip.NewOpenAI(vip.WithAPIKey("brk_live_..."))
+```
+
+`BLOCKRUN_API_KEY` selects the same mode for `NewAnthropic` / `NewOpenAI` when no key
+is passed explicitly, so an existing wallet-based program switches over with one
+environment variable and no code change. An explicit option always beats the env, and
+`WithBaseURL` still overrides the gateway.
+
+Notes:
+
+- **Chat only.** The account gateway serves `/v1/messages` and `/v1/chat/completions`.
+  Image, video, speech, music, RealFace/Portrait and search settle on-chain, so those
+  constructors need a wallet and reject an account key outright (a key found only in
+  `BLOCKRUN_API_KEY` is ignored by them rather than fatal).
+- **No chain.** `WithChain` / `WithWalletKey` describe a payment account mode never
+  makes, so combining them with an account key is an error, not a silent no-op.
+- **Passthrough caveat.** The account route is not byte-identical to the wallet route:
+  Anthropic ids come back as `msg_br_*` rather than native `msg_*`, and adaptive-thinking
+  models return real thinking signatures while some non-adaptive ones drop a `thinking`
+  block. OpenAI responses stay native (`chatcmpl-*` ids, `system_fingerprint`). The
+  strict "a relay detector sees a direct upstream call" claim above holds on the
+  **x402 wallet path**.
+- Any other `WithAPIKey` value is still just a placeholder upstream key and changes
+  nothing about payment.
 
 ## Solana
 

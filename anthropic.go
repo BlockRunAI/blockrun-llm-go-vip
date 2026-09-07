@@ -29,13 +29,18 @@ func NewAnthropic(opts ...Option) (anthropic.Client, error) {
 	if err != nil {
 		return anthropic.Client{}, err
 	}
-	return anthropic.NewClient(
+	reqOpts := []option.RequestOption{
 		// Default per-request timeout for reasoning models (200-300s+); set
 		// first so a per-call option.WithRequestTimeout still wins. Override the
 		// default via the BLOCKRUN_CHAT_TIMEOUT env var (integer seconds).
 		option.WithRequestTimeout(defaultChatTimeout()),
 		option.WithBaseURL(cfg.apiURL),
 		option.WithAPIKey(cfg.apiKey),
-		option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())),
-	), nil
+	}
+	// Account mode resolves no signer: the account's credit pays, so there is
+	// no 402 to negotiate and the transport stays untouched.
+	if sign != nil {
+		reqOpts = append(reqOpts, option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())))
+	}
+	return anthropic.NewClient(reqOpts...), nil
 }

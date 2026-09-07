@@ -102,6 +102,12 @@ func x402MiddlewareWithAllBackoffs(
 	unavailableBackoffs []time.Duration,
 ) transportMiddleware {
 	return func(req *http.Request, next func(*http.Request) (*http.Response, error)) (*http.Response, error) {
+		// No signer means no x402 payment to make (account-credit mode). Pass
+		// the request through untouched — buffering a body nothing will replay
+		// would only cost memory, and a 402 here is the caller's to see.
+		if sign == nil {
+			return next(req)
+		}
 		for k, v := range extraHeaders {
 			if req.Header.Get(k) == "" {
 				req.Header.Set(k, v)

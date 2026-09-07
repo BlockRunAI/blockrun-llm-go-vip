@@ -25,7 +25,7 @@ func NewOpenAI(opts ...Option) (openai.Client, error) {
 	if err != nil {
 		return openai.Client{}, err
 	}
-	return openai.NewClient(
+	reqOpts := []option.RequestOption{
 		// Default per-request timeout for reasoning models (200-300s+); set
 		// first so a per-call option.WithRequestTimeout still wins. Override the
 		// default via the BLOCKRUN_CHAT_TIMEOUT env var (integer seconds).
@@ -33,8 +33,13 @@ func NewOpenAI(opts ...Option) (openai.Client, error) {
 		// OpenAI SDK appends "chat/completions" to the base URL, so the
 		// gateway's /v1 prefix must be part of the base (Anthropic's SDK adds
 		// /v1/messages itself, so its base stays /api).
-		option.WithBaseURL(cfg.apiURL+"/v1"),
+		option.WithBaseURL(cfg.apiURL + "/v1"),
 		option.WithAPIKey(cfg.apiKey),
-		option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())),
-	), nil
+	}
+	// Account mode resolves no signer: the account's credit pays, so there is
+	// no 402 to negotiate and the transport stays untouched.
+	if sign != nil {
+		reqOpts = append(reqOpts, option.WithMiddleware(x402Middleware(sign, cfg.paymentRoutingHeaders())))
+	}
+	return openai.NewClient(reqOpts...), nil
 }
