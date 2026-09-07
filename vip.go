@@ -61,7 +61,9 @@ const (
 type config struct {
 	apiURL       string
 	apiKey       string
-	apiKeySet    bool
+	apiKeySet    bool   // true when WithAPIKey was passed explicitly
+	accountKey   bool   // true when the resolved key is a BlockRun account key
+	chainSet     bool   // true when WithChain was passed explicitly
 	privHex      string // optional explicit wallet key (Base hex or Solana bs58); empty means auto-load
 	chain        string // "base" (default) or "solana"
 	solanaRPCURL string // optional Solana RPC override (blockhash + mint info)
@@ -91,7 +93,10 @@ func WithWalletKey(key string) Option {
 // or "solana" (USDC on Solana via sol.blockrun.ai and the x402 SVM exact scheme).
 // It also switches the default gateway base URL to match the chain.
 func WithChain(chain string) Option {
-	return func(c *config) { c.chain = chain }
+	return func(c *config) {
+		c.chain = chain
+		c.chainSet = true
+	}
 }
 
 // WithSolanaRPCURL overrides the Solana JSON-RPC endpoint used while signing (to
@@ -101,8 +106,15 @@ func WithSolanaRPCURL(url string) Option {
 	return func(c *config) { c.solanaRPCURL = url }
 }
 
-// WithAPIKey selects account billing without a wallet. Empty/malformed keys
-// are rejected. When omitted, BLOCKRUN_API_KEY selects account mode.
+// WithAPIKey selects account billing without a wallet: pass a BlockRun account
+// key ("brk_…", from user.blockrun.ai) and requests go to the account gateway on
+// prepaid credit. When omitted, BLOCKRUN_API_KEY selects the same mode.
+//
+// Any other value keeps the x402 wallet rail and is only a placeholder override
+// for the key sent upstream — that is what WithAPIKey meant before v0.8.0, so
+// callers who copied `WithAPIKey("blockrun")` out of the old README keep
+// working. A truncated account key ("brk_" with nothing after it) is rejected
+// rather than quietly demoted to the wallet rail.
 func WithAPIKey(key string) Option {
 	return func(c *config) { c.apiKey = key; c.apiKeySet = true }
 }
@@ -137,6 +149,14 @@ func (c config) paymentRoutingHeaders() map[string]string {
 	}
 }
 
+// errNoCredential is what a caller with nothing configured sees. The chain was
+// inferred at that point, so the message names every way to pay rather than the
+// rail the inference happened to land on.
+var errNoCredential = fmt.Errorf("vip: no credential found — set BLOCKRUN_API_KEY=brk_… " +
+	"for account billing (no wallet needed, https://user.blockrun.ai/dashboard/keys), " +
+	"or a wallet key: BLOCKRUN_WALLET_KEY / ~/.blockrun/.session for Base, " +
+	"SOLANA_WALLET_KEY / ~/.blockrun/.solana-session for Solana")
+
 // resolveKey applies options and resolves the wallet key for the selected chain
 // (Base hex or Solana bs58). The media clients reuse blockrun-llm-go's clients,
 // which take the key directly.
@@ -148,19 +168,33 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if cfg.apiKeySet && cfg.privHex != "" {
+	// An explicit account key selects the account rail; an explicit anything
+	// else is the pre-0.8 placeholder upstream key and leaves the wallet rail
+	// alone. blockrun.IsAPIKey is the same predicate the main SDK applies, so a
+	// key that works there cannot be refused here (brk_test_ included).
+	if cfg.apiKeySet {
+		if err := checkAccountKey(cfg.apiKey); err != nil {
+			return cfg, "", err
+		}
+		cfg.accountKey = blockrun.IsAPIKey(cfg.apiKey)
+	}
+	if cfg.accountKey && cfg.privHex != "" {
 		return cfg, "", fmt.Errorf("vip: pass either WithAPIKey or WithWalletKey, not both")
 	}
+	// The environment key is consulted only when the call site named no
+	// credential of its own — an explicit wallet key or upstream-key override
+	// means the caller already chose.
 	if !cfg.apiKeySet && cfg.privHex == "" {
-		if key, exists := os.LookupEnv("BLOCKRUN_API_KEY"); exists {
-			cfg.apiKey = key
+		if env, exists := os.LookupEnv("BLOCKRUN_API_KEY"); exists && strings.TrimSpace(env) != "" {
+			if err := checkAccountKey(env); err != nil {
+				return cfg, "", err
+			}
+			cfg.apiKey = strings.TrimSpace(env)
 			cfg.apiKeySet = true
+			cfg.accountKey = true
 		}
 	}
-	if cfg.apiKeySet {
-		if !strings.HasPrefix(cfg.apiKey, "brk_live_") || len(cfg.apiKey) <= 9 || strings.ContainsAny(cfg.apiKey, " \n\r\t") {
-			return cfg, "", fmt.Errorf("vip: invalid BlockRun API key; create one at https://user.blockrun.ai/dashboard/keys")
-		}
+	if cfg.accountKey {
 		cfg.apiURL, err = accountBase(cfg.apiURL)
 		cfg.chain = "account"
 		return cfg, "", err
@@ -179,11 +213,17 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 		key = cfg.privHex
 		if key == "" {
 			key, err = blockrun.LoadSolanaWallet()
-			if err != nil {
+			if err != nil && cfg.chainSet {
 				return cfg, "", fmt.Errorf("vip: failed to load Solana wallet: %w", err)
 			}
 		}
 		if key == "" {
+			if !cfg.chainSet {
+				// Solana was inferred, not asked for: naming only the Solana
+				// variables would send someone who has no wallet at all down
+				// the wrong rail.
+				return cfg, "", errNoCredential
+			}
 			return cfg, "", fmt.Errorf("vip: no Solana wallet key (set SOLANA_WALLET_KEY or ~/.blockrun/.solana-session, or pass WithWalletKey)")
 		}
 		// Facilitator preference (Solana only): explicit option > env > the
@@ -211,6 +251,9 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 	if key == "" {
 		key, err = blockrun.LoadWallet()
 		if err != nil {
+			if !cfg.chainSet {
+				return cfg, "", errNoCredential
+			}
 			return cfg, "", fmt.Errorf("vip: no wallet key (set BLOCKRUN_WALLET_KEY or ~/.blockrun/.session, or pass WithWalletKey): %w", err)
 		}
 	}
