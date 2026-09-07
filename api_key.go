@@ -13,9 +13,35 @@ import (
 	"time"
 )
 
-func (c config) accountMode() bool { return c.apiKeySet }
+func (c config) accountMode() bool { return c.accountKey }
 
+// checkAccountKey rejects a credential that means to be an account key but is
+// not one. A bare or truncated "brk_" secret would otherwise be demoted to the
+// wallet rail silently and fail much later, which is the opposite of this
+// rail's promise that a bad credential fails where you set it. Anything that
+// does not look like an account key at all is not this function's business —
+// it is the pre-0.8 placeholder upstream key.
+func checkAccountKey(key string) error {
+	trimmed := strings.TrimSpace(key)
+	if blockrun.IsAPIKey(trimmed) {
+		if trimmed != key {
+			return fmt.Errorf("vip: BlockRun API key has surrounding whitespace")
+		}
+		return nil
+	}
+	if strings.HasPrefix(trimmed, blockrun.APIKeyPrefix) {
+		return fmt.Errorf("vip: invalid BlockRun API key; create one at https://user.blockrun.ai/dashboard/keys")
+	}
+	return nil
+}
+
+// accountBase resolves the account gateway root. BLOCKRUN_API_KEY_URL is the
+// main SDK's name for it and wins; BLOCKRUN_API_BASE_URL is kept because this
+// package shipped it first.
 func accountBase(raw string) (string, error) {
+	if raw == "" {
+		raw = os.Getenv("BLOCKRUN_API_KEY_URL")
+	}
 	if raw == "" {
 		raw = os.Getenv("BLOCKRUN_API_BASE_URL")
 	}

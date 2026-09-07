@@ -42,12 +42,16 @@ OpenAI/Anthropic native clients, Image/Speech/Music/Video, Voice/Phone,
 Search/Exa and RealFace/Portrait share account authentication. Media submission
 and polling use the same key; no x402 signing or wallet fallback occurs on
 account errors. The root defaults to `https://api.blockrun.ai` and accepts
-`WithBaseURL` or `BLOCKRUN_API_BASE_URL` (trailing `/v1` is normalized). Credentials
+`WithBaseURL`, `BLOCKRUN_API_KEY_URL` (the main SDK's name for it) or
+`BLOCKRUN_API_BASE_URL` (trailing `/v1` is normalized). Credentials
 are restricted to that origin and redirects are disabled. Account billing is
 reported in the portal; wallet-owned asset lists still require a wallet.
 
 `WithAPIKey` plus `WithWalletKey` is rejected. An explicit wallet key overrides
-an environment API key. Without account credentials, explicit/saved wallet
+an environment API key. A value that is not an account key (`vip.WithAPIKey("blockrun")`,
+the pre-v0.8 form) is still just the placeholder key sent upstream and keeps the
+x402 wallet rail; a truncated `brk_` secret is rejected where you set it. Any key
+the main SDK accepts is accepted here, `brk_test_` included. Without account credentials, explicit/saved wallet
 choices and existing Base-only wallets are retained; otherwise Solana is
 preferred. Chain/facilitator options do not select a billing chain in account mode.
 
