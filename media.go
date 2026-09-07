@@ -47,7 +47,7 @@ func NewRealFace(opts ...Option) (*RealFace, error) {
 		return nil, err
 	}
 	if cfg.accountMode() {
-		return blockrun.NewRealFaceClientWithAPIKey(cfg.apiKey, blockrun.WithRealFaceAPIURL(cfg.apiURL))
+		return blockrun.NewRealFaceClient(cfg.apiKey, blockrun.WithRealFaceAPIURL(cfg.apiURL))
 	}
 	if cfg.isSolana() {
 		return blockrun.NewRealFaceClientSolana(key, cfg.solanaRPCURL, blockrun.WithRealFaceAPIURL(cfg.apiURL))
@@ -63,7 +63,7 @@ func NewPortrait(opts ...Option) (*Portrait, error) {
 		return nil, err
 	}
 	if cfg.accountMode() {
-		return blockrun.NewPortraitClientWithAPIKey(cfg.apiKey, blockrun.WithPortraitAPIURL(cfg.apiURL))
+		return blockrun.NewPortraitClient(cfg.apiKey, blockrun.WithPortraitAPIURL(cfg.apiURL))
 	}
 	if cfg.isSolana() {
 		return blockrun.NewPortraitClientSolana(key, cfg.solanaRPCURL, blockrun.WithPortraitAPIURL(cfg.apiURL))

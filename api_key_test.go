@@ -38,8 +38,14 @@ func TestAccountAllConstructors(t *testing.T) {
 			t.Fatalf("constructor %d: %v", i, e)
 		}
 	}
-	if _, e := os.Stat(filepath.Join(os.Getenv("HOME"), ".blockrun")); !os.IsNotExist(e) {
-		t.Fatal("account constructors created wallet state")
+	// No wallet may be created or loaded on the account rail. The upstream
+	// clients do create ~/.blockrun for their local cost log (NewCostLog
+	// mkdir's it), which is not wallet state — so assert on the key material
+	// itself, which is the property that actually matters here.
+	for _, name := range []string{".session", ".solana-session", "solana-wallet.json"} {
+		if _, e := os.Stat(filepath.Join(os.Getenv("HOME"), ".blockrun", name)); !os.IsNotExist(e) {
+			t.Fatalf("account constructors created wallet key material: %s", name)
+		}
 	}
 	cfg, sign, e := resolveSigner()
 	if e != nil || sign != nil || !cfg.accountMode() {
@@ -115,7 +121,11 @@ func TestAccountVideoQuotaNoPaymentRetry(t *testing.T) {
 			}
 			_, e = v.Submit(context.Background(), "cat", nil)
 			var apiErr *blockrun.APIError
-			if !errors.As(e, &apiErr) || apiErr.StatusCode != status || apiErr.RetryAfter != "12" || strings.Contains(e.Error(), accountTestKey) || calls.Load() != 1 {
+			if !errors.As(e, &apiErr) {
+				t.Fatalf("quota: %v calls %d", e, calls.Load())
+			}
+			retryAfter, _ := apiErr.Body["retry_after"].(string)
+			if apiErr.StatusCode != status || retryAfter != "12" || strings.Contains(e.Error(), accountTestKey) || calls.Load() != 1 {
 				t.Fatalf("quota: %v calls %d", e, calls.Load())
 			}
 		})

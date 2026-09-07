@@ -51,16 +51,20 @@ an environment API key. Without account credentials, explicit/saved wallet
 choices and existing Base-only wallets are retained; otherwise Solana is
 preferred. Chain/facilitator options do not select a billing chain in account mode.
 
-This review branch depends on [main Go SDK PR #28](https://github.com/BlockRunAI/blockrun-llm-go/pull/28).
-Its `go.mod` pins the tested SDK commit with a temporary replacement. **Do not
-publish this VIP change until the main SDK is released and this replacement is
-removed in favor of the canonical released version.** Go dependencies do not
-inherit a dependency's `replace` directive; applications testing this branch
-must apply the same explicit replacement in their own `go.mod`.
+The account rail rides on the released `blockrun-llm-go` v0.21.1, whose
+constructors take a `brk_` key wherever they take a wallet key — no `replace`
+directive, so applications get it from a plain `go get`.
 
-Production Responses streaming and video polling acceptance also require
-Enterprise PR #10 deployment and video signing-secret provisioning. Local
-protocol tests cover these paths; this is not a claim they are already live.
+One caveat on the "verbatim" promise above: it is exact on the **x402 wallet
+rail**. On the account rail the Anthropic responses carry gateway message ids
+(`msg_br_…` rather than a native `msg_…`), and adaptive-thinking models return
+real thinking signatures while some non-adaptive ones drop a `thinking` block
+that the wallet rail keeps. OpenAI responses stay native on both rails
+(`chatcmpl-…` ids, `system_fingerprint`, token-detail usage).
+
+Video polling acceptance additionally requires the gateway's video
+signing-secret provisioning; local protocol tests cover that path, which is not
+a claim it is already live.
 
 ## Install
 

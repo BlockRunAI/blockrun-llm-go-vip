@@ -3,7 +3,7 @@ module github.com/BlockRunAI/blockrun-llm-go-vip
 go 1.23.0
 
 require (
-	github.com/BlockRunAI/blockrun-llm-go v0.19.3
+	github.com/BlockRunAI/blockrun-llm-go v0.21.1
 	github.com/anthropics/anthropic-sdk-go v1.46.0
 	github.com/openai/openai-go v1.12.0
 )
@@ -62,4 +62,3 @@ require (
 )
 
 // Integration pin for P0 SDK PR #28. Replace with its canonical release before publishing.
-replace github.com/BlockRunAI/blockrun-llm-go => github.com/KillerQueen-Z/blockrun-llm-go v0.18.1-0.20260904170517-9417efc0f7d9
