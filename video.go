@@ -331,7 +331,14 @@ func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte)
 			return 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
-			return resp.StatusCode, nil, &blockrun.APIError{StatusCode: resp.StatusCode, Message: string(data), RetryAfter: resp.Header.Get("Retry-After")}
+			apiErr := &blockrun.APIError{StatusCode: resp.StatusCode, Message: string(data)}
+			// Retry-After rides in Body: upstream's APIError has no field for
+			// it, and dropping it would cost a caller the gateway's own hint
+			// about when the job is worth asking about again.
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				apiErr.Body = map[string]any{"retry_after": ra}
+			}
+			return resp.StatusCode, nil, apiErr
 		}
 		return resp.StatusCode, data, nil
 	}
