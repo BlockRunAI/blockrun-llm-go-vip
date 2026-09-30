@@ -3,7 +3,7 @@ module github.com/BlockRunAI/blockrun-llm-go-vip
 go 1.23.0
 
 require (
-	github.com/BlockRunAI/blockrun-llm-go v0.21.1
+	github.com/BlockRunAI/blockrun-llm-go v0.21.2
 	github.com/anthropics/anthropic-sdk-go v1.46.0
 	github.com/openai/openai-go v1.12.0
 )
