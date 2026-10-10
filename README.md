@@ -174,10 +174,21 @@ fmt.Println(job.ID, job.Status) // e.g. "bytedance:video_…", "queued"
 
 for !job.Done() {
     time.Sleep(12 * time.Second)
-    video.Poll(ctx, job) // re-signs x402, advances job.Status
+    video.Poll(ctx, job) // advances job.Status (see "How polling pays" below)
 }
 fmt.Println(job.Response.Data[0].URL) // permanent BlockRun-hosted MP4
 ```
+
+How polling pays: on **Solana** (`vip.WithChain("solana")`) each poll proves the
+job is yours with a fresh ed25519 signature from your wallet over
+`blockrun-poll:v1:video:<job id>:<unix seconds>` (headers `x-poll-wallet`,
+`x-poll-timestamp`, `x-poll-signature`) — no payment is signed while the job is
+pending. When the video is ready the gateway answers that poll with a 402
+(`"status":"completed"`); `Poll` signs exactly one payment from it and re-sends,
+which settles the job and returns the video. If the gateway refuses the proof for
+a job (e.g. one submitted before it bound payers, or a clock more than 300s off),
+`Poll` logs it and falls back to x-payment polling for that job. Your system clock
+must be within ±300s of real time. On **Base** every poll re-signs x402 as before.
 
 `video.Wait(ctx, job)` blocks until done, and `video.Generate(ctx, prompt, opts)` is
 shorthand for `Submit`+`Wait` (one blocking call). `Video` is implemented natively in

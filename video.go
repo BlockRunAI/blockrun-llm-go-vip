@@ -3,9 +3,11 @@ package vip
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,8 +19,9 @@ import (
 const (
 	videoEndpoint = "/v1/videos/generations"
 	// The gateway now runs video generation asynchronously: POST returns 202
-	// with a poll_url, and the client must GET it (re-signing x402) until the
-	// job is completed. These bound that poll loop.
+	// with a poll_url, and the client must GET it until the job is completed
+	// (on Solana with a signed ownership proof, see poll_ownership.go; on Base
+	// re-signing x402). These bound that poll loop.
 	defaultVideoPollInterval = 12 * time.Second
 	defaultVideoMaxWait      = 5 * time.Minute
 )
@@ -42,6 +45,13 @@ type Video struct {
 	httpClient   *http.Client
 	pollInterval time.Duration
 	maxWait      time.Duration
+
+	// pollKey is the Solana wallet's ed25519 key, set only on the Solana
+	// wallet rail. When set, Poll proves job ownership with x-poll-* headers
+	// instead of signing a payment per poll. nil on Base and the account rail.
+	pollKey ed25519.PrivateKey
+	now     func() time.Time                 // clock for the proof timestamp; time.Now
+	logf    func(format string, args ...any) // log.Printf; swapped in tests
 }
 
 // Video job statuses returned by the gateway.
@@ -61,6 +71,10 @@ type VideoJob struct {
 	Response *VideoResponse // populated once completed
 	PollURL  string         // absolute poll URL (empty if already completed at submit)
 	Raw      []byte         // raw JSON of the most recent gateway response
+
+	// paymentPolling is set once the gateway refused this job's ownership
+	// proof; from then on the job is polled with x-payment only.
+	paymentPolling bool
 }
 
 // Done reports whether the job has reached a terminal state.
@@ -76,13 +90,19 @@ func (j *VideoJob) Done() bool {
 //	})
 //	fmt.Println(job.Data[0].URL)
 func NewVideo(opts ...Option) (*Video, error) {
-	cfg, sign, err := resolveSigner(opts...)
+	cfg, sign, key, err := resolveSignerWithKey(opts...)
 	if err != nil {
 		return nil, err
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	if cfg.accountMode() {
 		client = cfg.accountHTTPClient(60 * time.Second)
+	}
+	var pollKey ed25519.PrivateKey
+	if !cfg.accountMode() && cfg.isSolana() {
+		if pollKey, err = solanaPollKey(key); err != nil {
+			return nil, err
+		}
 	}
 	return &Video{
 		accountMode:  cfg.accountMode(),
@@ -91,6 +111,9 @@ func NewVideo(opts ...Option) (*Video, error) {
 		httpClient:   client,
 		pollInterval: defaultVideoPollInterval,
 		maxWait:      defaultVideoMaxWait,
+		pollKey:      pollKey,
+		now:          time.Now,
+		logf:         log.Printf,
 	}, nil
 }
 
@@ -110,7 +133,7 @@ func (v *Video) Submit(ctx context.Context, prompt string, opts *VideoGenerateOp
 		return nil, fmt.Errorf("vip: encode video request: %w", err)
 	}
 
-	status, respBytes, err := v.doX402(ctx, http.MethodPost, v.apiURL+videoEndpoint, jsonBody)
+	status, respBytes, err := v.doX402(ctx, http.MethodPost, v.apiURL+videoEndpoint, jsonBody, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -221,12 +244,21 @@ func buildVideoBody(prompt string, opts *VideoGenerateOptions) (map[string]any, 
 	return body, nil
 }
 
-// Poll advances the job by one status check (re-signing x402). It updates
-// job.Status/Raw and, on completion, job.Response. It is a no-op once the job
-// is Done. This is where payment actually settles: the gateway transfers the
-// USDC exactly once, on the first poll that observes status=completed. Polls
-// that see queued/in_progress charge nothing, and a job that ends failed is
-// never charged.
+// Poll advances the job by one status check. It updates job.Status/Raw and, on
+// completion, job.Response. It is a no-op once the job is Done. This is where
+// payment actually settles: the gateway transfers the USDC exactly once, on the
+// first poll that observes status=completed. Polls that see queued/in_progress
+// charge nothing, and a job that ends failed is never charged.
+//
+// On Solana each poll carries a fresh ed25519 ownership proof (x-poll-*
+// headers) instead of a signed payment, so a pending poll signs no payment at
+// all. When the video is ready the gateway answers that poll with a 402 whose
+// body says status "completed"; Poll signs ONE payment from that challenge and
+// re-sends the GET with it, which settles the job and returns the video. If the
+// gateway refuses the proof for this job ("Invalid job id" — e.g. a job
+// submitted before the gateway bound its payer, or a clock more than 300s off),
+// Poll falls back once, for the rest of this job, to x-payment polling. On Base
+// every poll re-signs x402 as before.
 func (v *Video) Poll(ctx context.Context, job *VideoJob) error {
 	if job.Done() {
 		return nil
@@ -234,12 +266,33 @@ func (v *Video) Poll(ctx context.Context, job *VideoJob) error {
 	if job.PollURL == "" {
 		return fmt.Errorf("vip: job has no poll URL")
 	}
-	status, body, err := v.doX402(ctx, http.MethodGet, job.PollURL, nil)
+	var ownership map[string]string
+	if v.pollKey != nil && !v.accountMode && !job.paymentPolling {
+		ownership = pollAuthHeaders(v.pollKey, pollKindVideo, pollJobID(job.PollURL, job.ID), v.clock())
+	}
+	status, body, err := v.doX402(ctx, http.MethodGet, job.PollURL, nil, ownership)
 	if err != nil {
 		return err
 	}
+	if ownership != nil && isPollOwnershipRefusal(status, body) {
+		job.paymentPolling = true
+		v.log("vip: gateway refused the poll-ownership proof for video job %s; falling back to x-payment polling for this job", job.ID)
+		status, body, err = v.doX402(ctx, http.MethodGet, job.PollURL, nil, nil)
+		if err != nil {
+			return err
+		}
+	}
 	job.Raw = body
 	if status == http.StatusOK {
+		// A job that failed upstream answers 200 {"status":"failed"} and is
+		// never charged; it is not a completed video.
+		var meta struct {
+			Status string `json:"status"`
+		}
+		if json.Unmarshal(body, &meta) == nil && meta.Status == VideoStatusFailed {
+			job.Status = VideoStatusFailed
+			return nil
+		}
 		resp, err := decodeVideoResponse(body)
 		if err != nil {
 			return err
@@ -298,9 +351,40 @@ func (v *Video) Generate(ctx context.Context, prompt string, opts *VideoGenerate
 	return v.Wait(ctx, job)
 }
 
+// isPollOwnershipRefusal reports the gateway's refusal of an ownership proof:
+// wrong wallet, bad signature, stale timestamp or a job with no bound payer all
+// answer exactly like an unknown job (400 "Invalid job id"), so they cannot be
+// told apart — nor need to be: the remedy for each is the x-payment poll.
+func isPollOwnershipRefusal(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal(body, &e) == nil && e.Error == "Invalid job id"
+}
+
+func (v *Video) clock() time.Time {
+	if v.now != nil {
+		return v.now()
+	}
+	return time.Now()
+}
+
+func (v *Video) log(format string, args ...any) {
+	if v.logf != nil {
+		v.logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
 // doX402 performs an HTTP request and, on a 402, signs an x402 payment and
-// retries once with the payment header.
-func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte) (int, []byte, error) {
+// retries once with the payment header. firstHeaders (the Solana poll-ownership
+// proof, or nil) ride on the first request only: the payment retry proves
+// ownership with the payment itself, which is the gateway's paid-poll path.
+func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte, firstHeaders map[string]string) (int, []byte, error) {
 	newReq := func() (*http.Request, error) {
 		var r io.Reader
 		if body != nil {
@@ -319,6 +403,9 @@ func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte)
 	req, err := newReq()
 	if err != nil {
 		return 0, nil, err
+	}
+	for k, val := range firstHeaders {
+		req.Header.Set(k, val)
 	}
 	resp, err := v.httpClient.Do(req)
 	if err != nil {

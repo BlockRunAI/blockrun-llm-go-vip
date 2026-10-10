@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/BlockRunAI/blockrun-llm-go v0.21.2
 	github.com/anthropics/anthropic-sdk-go v1.46.0
+	github.com/mr-tron/base58 v1.3.0
 	github.com/openai/openai-go v1.12.0
 )
 
@@ -40,7 +41,6 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/mostynb/zstdpool-freelist v0.0.0-20201229113212-927304c0c3b1 // indirect
-	github.com/mr-tron/base58 v1.3.0 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
 	github.com/streamingfast/logging v0.0.0-20230608130331-f22c91403091 // indirect
 	github.com/supranational/blst v0.3.13 // indirect
