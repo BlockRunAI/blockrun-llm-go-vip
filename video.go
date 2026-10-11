@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,14 @@ const (
 	// re-signing x402). These bound that poll loop.
 	defaultVideoPollInterval = 12 * time.Second
 	defaultVideoMaxWait      = 5 * time.Minute
+
+	// maxVideoPaidPollRetries bounds consecutive Solana paid polls whose
+	// outcome is unknown (lost in transit, or a 402 "settlement in progress")
+	// before Poll reports the payment as in doubt.
+	maxVideoPaidPollRetries = 4
+	// maxVideoRetryAfter caps a poll's Retry-After (the gateway asks for 90s
+	// at most, while a timed-out settle's claim is held).
+	maxVideoRetryAfter = 120 * time.Second
 )
 
 // Video generates short videos through ByteDance Seedance (and Grok Imagine)
@@ -75,6 +84,10 @@ type VideoJob struct {
 	// paymentPolling is set once the gateway refused this job's ownership
 	// proof; from then on the job is polled with x-payment only.
 	paymentPolling bool
+	// paidInDoubt counts consecutive Solana paid polls whose outcome is
+	// unknown; retryAfter is the gateway's hint for the next poll (Solana).
+	paidInDoubt int
+	retryAfter  time.Duration
 }
 
 // Done reports whether the job has reached a terminal state.
@@ -133,7 +146,7 @@ func (v *Video) Submit(ctx context.Context, prompt string, opts *VideoGenerateOp
 		return nil, fmt.Errorf("vip: encode video request: %w", err)
 	}
 
-	status, respBytes, err := v.doX402(ctx, http.MethodPost, v.apiURL+videoEndpoint, jsonBody, nil)
+	status, respBytes, err := v.doX402(ctx, http.MethodPost, v.apiURL+videoEndpoint, jsonBody)
 	if err != nil {
 		return nil, err
 	}
@@ -257,8 +270,17 @@ func buildVideoBody(prompt string, opts *VideoGenerateOptions) (map[string]any, 
 // re-sends the GET with it, which settles the job and returns the video. If the
 // gateway refuses the proof for this job ("Invalid job id" — e.g. a job
 // submitted before the gateway bound its payer, or a clock more than 300s off),
-// Poll falls back once, for the rest of this job, to x-payment polling. On Base
-// every poll re-signs x402 as before.
+// Poll falls back once, for the rest of this job, to x-payment polling.
+//
+// On Solana a paid poll whose outcome is unknown — the answer was lost in
+// transit, or the gateway answered 402 "settlement in progress" / "outcome
+// unknown" / "settlement failed" — is not an error: Poll returns nil with the
+// job still pending, and the next poll reads the job's settlement record (the
+// video, with no new charge, if that payment landed) or asks again. The gateway
+// settles a job at most once. After maxVideoPaidPollRetries such polls in a row
+// Poll returns a *VideoPaymentInDoubtError naming the poll URL to resume from.
+//
+// On Base every poll re-signs x402 as before.
 func (v *Video) Poll(ctx context.Context, job *VideoJob) error {
 	if job.Done() {
 		return nil
@@ -266,22 +288,18 @@ func (v *Video) Poll(ctx context.Context, job *VideoJob) error {
 	if job.PollURL == "" {
 		return fmt.Errorf("vip: job has no poll URL")
 	}
-	var ownership map[string]string
-	if v.pollKey != nil && !v.accountMode && !job.paymentPolling {
-		ownership = pollAuthHeaders(v.pollKey, pollKindVideo, pollJobID(job.PollURL, job.ID), v.clock())
+	if v.pollKey != nil && !v.accountMode {
+		return v.pollSolana(ctx, job)
 	}
-	status, body, err := v.doX402(ctx, http.MethodGet, job.PollURL, nil, ownership)
+	status, body, err := v.doX402(ctx, http.MethodGet, job.PollURL, nil)
 	if err != nil {
 		return err
 	}
-	if ownership != nil && isPollOwnershipRefusal(status, body) {
-		job.paymentPolling = true
-		v.log("vip: gateway refused the poll-ownership proof for video job %s; falling back to x-payment polling for this job", job.ID)
-		status, body, err = v.doX402(ctx, http.MethodGet, job.PollURL, nil, nil)
-		if err != nil {
-			return err
-		}
-	}
+	return applyVideoPoll(job, status, body)
+}
+
+// applyVideoPoll records one poll answer (200 or 202) on the job.
+func applyVideoPoll(job *VideoJob, status int, body []byte) error {
 	job.Raw = body
 	if status == http.StatusOK {
 		// A job that failed upstream answers 200 {"status":"failed"} and is
@@ -315,6 +333,138 @@ func (v *Video) Poll(ctx context.Context, job *VideoJob) error {
 	return nil
 }
 
+// pollSolana is one poll on the Solana wallet rail (see Poll). Every request it
+// sends is accounted for separately, so a refusal is only ever read off the
+// proof request itself and a payment is signed at most once per call.
+func (v *Video) pollSolana(ctx context.Context, job *VideoJob) error {
+	job.retryAfter = 0
+	challenge := ""
+
+	if !job.paymentPolling {
+		proof := pollAuthHeaders(v.pollKey, pollKindVideo, pollJobID(job.PollURL, job.ID), v.clock())
+		status, body, hdr, err := v.get(ctx, job.PollURL, proof)
+		if err != nil {
+			// The proof request carries no payment: nothing can have been charged.
+			return err
+		}
+		switch {
+		case isPollOwnershipRefusal(status, body):
+			v.fallBackToPaymentPolling(job, "the gateway refused the poll-ownership proof (HTTP 400)")
+		case status == http.StatusPaymentRequired:
+			var meta struct {
+				Status string `json:"status"`
+			}
+			if json.Unmarshal(body, &meta) == nil && meta.Status == VideoStatusCompleted {
+				// Finished and unpaid: this challenge is the one payment for the job.
+				if challenge = paymentRequirementFrom(hdr, body); challenge == "" {
+					return &blockrun.PaymentError{Message: "402 response but no payment requirements found"}
+				}
+			} else {
+				v.fallBackToPaymentPolling(job, "the gateway answered the poll-ownership proof with a payment challenge")
+			}
+		case isTransientVideoPoll(status):
+			job.Raw = body
+			job.retryAfter = videoRetryAfter(hdr)
+			return nil
+		default:
+			job.retryAfter = videoRetryAfter(hdr)
+			return applyVideoPoll(job, status, body)
+		}
+	}
+
+	if challenge == "" {
+		// x-payment polling: an unpaid GET for a 402 carrying a fresh blockhash.
+		status, body, hdr, err := v.get(ctx, job.PollURL, nil)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusPaymentRequired {
+			job.retryAfter = videoRetryAfter(hdr)
+			return applyVideoPoll(job, status, body)
+		}
+		if challenge = paymentRequirementFrom(hdr, body); challenge == "" {
+			return &blockrun.PaymentError{Message: "402 response but no payment requirements found"}
+		}
+	}
+
+	signature, err := v.sign(challenge, job.PollURL)
+	if err != nil {
+		return err
+	}
+	status, body, hdr, err := v.get(ctx, job.PollURL, map[string]string{
+		// The gateway accepts PAYMENT-SIGNATURE; the video poll docs also
+		// mention an x-payment header, so set both for compatibility.
+		"PAYMENT-SIGNATURE": signature,
+		"X-PAYMENT":         signature,
+	})
+	if err != nil {
+		// The payment may have reached the gateway and settled with only the
+		// answer lost. Never give up on a job that may be paid for: the next
+		// poll reads the settlement record, or asks again if it never settled.
+		return v.paidPollInDoubt(ctx, job, fmt.Errorf("paid poll failed in transit: %w", err), 0)
+	}
+	if status == http.StatusPaymentRequired {
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &e) == nil && e.Error == "Payment verification failed" {
+			// Refused at verification: settlement never ran, nothing was charged.
+			job.Raw = body
+			return &blockrun.PaymentError{Message: fmt.Sprintf(
+				"payment for video job %s was rejected at verification (nothing charged): %s. Check your Solana USDC balance, then resume by polling %s with the same wallet",
+				job.ID, string(body), job.PollURL)}
+		}
+		// Settlement in progress on another poll, outcome unknown, or a failed
+		// settle. Re-polling is the gateway's documented recovery and cannot
+		// charge twice: a per-job claim lets only one poll settle, and a claim
+		// whose settle timed out is checked on chain before anything new settles.
+		job.Raw = body
+		return v.paidPollInDoubt(ctx, job, &blockrun.APIError{StatusCode: status, Message: fmt.Sprintf("video poll failed: %s", string(body))}, videoRetryAfter(hdr))
+	}
+	if isTransientVideoPoll(status) {
+		// A 503/504 answering a payment is as unknown as a lost answer.
+		job.Raw = body
+		return v.paidPollInDoubt(ctx, job, &blockrun.APIError{StatusCode: status, Message: fmt.Sprintf("video poll failed: %s", string(body))}, videoRetryAfter(hdr))
+	}
+	job.paidInDoubt = 0
+	job.retryAfter = videoRetryAfter(hdr)
+	return applyVideoPoll(job, status, body)
+}
+
+// paidPollInDoubt records a paid poll whose outcome is unknown and decides
+// whether the job is still worth re-polling.
+func (v *Video) paidPollInDoubt(ctx context.Context, job *VideoJob, cause error, retryAfter time.Duration) error {
+	job.paidInDoubt++
+	job.retryAfter = retryAfter
+	if job.paidInDoubt >= maxVideoPaidPollRetries || ctx.Err() != nil {
+		return &VideoPaymentInDoubtError{JobID: job.ID, PollURL: job.PollURL, Err: cause}
+	}
+	v.log("vip: payment for video job %s is not confirmed (%v); re-polling — the gateway settles a job at most once", job.ID, cause)
+	return nil
+}
+
+func (v *Video) fallBackToPaymentPolling(job *VideoJob, why string) {
+	job.paymentPolling = true
+	v.log("vip: video job %s: %s; falling back to x-payment polling for this job", job.ID, why)
+}
+
+// VideoPaymentInDoubtError reports a payment for a finished video that was
+// sent but not confirmed: it may have settled. Do NOT submit the video again —
+// resume by polling PollURL with the same wallet (a VideoJob with this ID and
+// PollURL, passed to Video.Poll or Video.Wait). If the payment settled, that
+// poll returns the video with no new charge; if it did not, it settles once.
+type VideoPaymentInDoubtError struct {
+	JobID   string
+	PollURL string
+	Err     error
+}
+
+func (e *VideoPaymentInDoubtError) Error() string {
+	return fmt.Sprintf("vip: payment for finished video job %s may have settled (%v); resume by polling %s with the same wallet before submitting again", e.JobID, e.Err, e.PollURL)
+}
+
+func (e *VideoPaymentInDoubtError) Unwrap() error { return e.Err }
+
 // Wait blocks, polling at the client's interval, until the job completes or the
 // max wait elapses. Returns the completed job's response.
 func (v *Video) Wait(ctx context.Context, job *VideoJob) (*VideoResponse, error) {
@@ -327,12 +477,22 @@ func (v *Video) Wait(ctx context.Context, job *VideoJob) (*VideoResponse, error)
 			break
 		}
 		if time.Now().After(deadline) {
+			if job.paidInDoubt > 0 {
+				return nil, &VideoPaymentInDoubtError{JobID: job.ID, PollURL: job.PollURL, Err: fmt.Errorf("not confirmed after %s", v.maxWait)}
+			}
 			return nil, fmt.Errorf("vip: video not ready after %s (still generating; job %s)", v.maxWait, job.ID)
+		}
+		wait := v.pollInterval
+		if job.retryAfter > 0 {
+			wait = job.retryAfter
 		}
 		select {
 		case <-ctx.Done():
+			if job.paidInDoubt > 0 {
+				return nil, &VideoPaymentInDoubtError{JobID: job.ID, PollURL: job.PollURL, Err: ctx.Err()}
+			}
 			return nil, ctx.Err()
-		case <-time.After(v.pollInterval):
+		case <-time.After(wait):
 		}
 	}
 	if job.Status == VideoStatusFailed {
@@ -365,6 +525,55 @@ func isPollOwnershipRefusal(status int, body []byte) bool {
 	return json.Unmarshal(body, &e) == nil && e.Error == "Invalid job id"
 }
 
+// isTransientVideoPoll is a poll answer that means "not yet, ask again":
+// a gateway or upstream 503/504.
+func isTransientVideoPoll(status int) bool {
+	return status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// videoRetryAfter is the poll's Retry-After (delta-seconds only), capped at
+// maxVideoRetryAfter; 0 when absent or unusable.
+func videoRetryAfter(hdr http.Header) time.Duration {
+	raw := strings.TrimSpace(hdr.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	if d := time.Duration(secs) * time.Second; d < maxVideoRetryAfter {
+		return d
+	}
+	return maxVideoRetryAfter
+}
+
+// paymentRequirementFrom reads the x402 challenge from an already-read 402.
+func paymentRequirementFrom(hdr http.Header, body []byte) string {
+	return readPaymentRequirement(&http.Response{Header: hdr, Body: io.NopCloser(bytes.NewReader(body))})
+}
+
+// get sends one GET with the given extra headers and reads the whole answer.
+func (v *Video) get(ctx context.Context, fullURL string, headers map[string]string) (int, []byte, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	for k, val := range headers {
+		req.Header.Set(k, val)
+	}
+	resp, err := v.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("vip: video request: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("vip: video request: %w", err)
+	}
+	return resp.StatusCode, data, resp.Header, nil
+}
+
 func (v *Video) clock() time.Time {
 	if v.now != nil {
 		return v.now()
@@ -381,10 +590,8 @@ func (v *Video) log(format string, args ...any) {
 }
 
 // doX402 performs an HTTP request and, on a 402, signs an x402 payment and
-// retries once with the payment header. firstHeaders (the Solana poll-ownership
-// proof, or nil) ride on the first request only: the payment retry proves
-// ownership with the payment itself, which is the gateway's paid-poll path.
-func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte, firstHeaders map[string]string) (int, []byte, error) {
+// retries once with the payment header.
+func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte) (int, []byte, error) {
 	newReq := func() (*http.Request, error) {
 		var r io.Reader
 		if body != nil {
@@ -403,9 +610,6 @@ func (v *Video) doX402(ctx context.Context, method, fullURL string, body []byte,
 	req, err := newReq()
 	if err != nil {
 		return 0, nil, err
-	}
-	for k, val := range firstHeaders {
-		req.Header.Set(k, val)
 	}
 	resp, err := v.httpClient.Do(req)
 	if err != nil {

@@ -188,7 +188,14 @@ pending. When the video is ready the gateway answers that poll with a 402
 which settles the job and returns the video. If the gateway refuses the proof for
 a job (e.g. one submitted before it bound payers, or a clock more than 300s off),
 `Poll` logs it and falls back to x-payment polling for that job. Your system clock
-must be within ±300s of real time. On **Base** every poll re-signs x402 as before.
+must be within ±300s of real time. If the answer to that one paid poll is lost
+or the gateway reports the settlement as in progress, `Poll` keeps polling (the
+gateway settles a job at most once and hands back the video if it already did);
+after 4 such polls in a row it returns a `*vip.VideoPaymentInDoubtError` carrying
+the `PollURL` — resume by polling it with the same wallet, never by submitting
+again. On **Base** every poll re-signs x402 as before. On every rail, a job that
+failed upstream now ends as `failed` (never charged) instead of `completed` with
+no video.
 
 `video.Wait(ctx, job)` blocks until done, and `video.Generate(ctx, prompt, opts)` is
 shorthand for `Submit`+`Wait` (one blocking call). `Video` is implemented natively in
