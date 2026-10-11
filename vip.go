@@ -265,26 +265,35 @@ func resolveKey(opts ...Option) (cfg config, key string, err error) {
 // Video client. Base signs EIP-712 (secp256k1); Solana signs the SVM exact scheme
 // (ed25519).
 func resolveSigner(opts ...Option) (cfg config, sign paymentSigner, err error) {
-	cfg, key, err := resolveKey(opts...)
+	cfg, sign, _, err = resolveSignerWithKey(opts...)
+	return cfg, sign, err
+}
+
+// resolveSignerWithKey is resolveSigner that also returns the resolved wallet
+// key, for a client that signs something other than a payment with it (the
+// Video client's Solana poll-ownership proof). The key is empty on the account
+// rail.
+func resolveSignerWithKey(opts ...Option) (cfg config, sign paymentSigner, key string, err error) {
+	cfg, key, err = resolveKey(opts...)
 	if err != nil {
-		return cfg, nil, err
+		return cfg, nil, "", err
 	}
 
 	if cfg.accountMode() {
-		return cfg, nil, nil
+		return cfg, nil, "", nil
 	}
 	if cfg.isSolana() {
 		rpc := cfg.solanaRPCURL
 		return cfg, func(paymentHeader, requestURL string) (string, error) {
 			return signSolanaPayment(key, rpc, paymentHeader, requestURL)
-		}, nil
+		}, key, nil
 	}
 
 	priv, err := blockrun.GetPrivateKeyFromHex(key)
 	if err != nil {
-		return cfg, nil, fmt.Errorf("vip: invalid wallet key: %w", err)
+		return cfg, nil, "", fmt.Errorf("vip: invalid wallet key: %w", err)
 	}
 	return cfg, func(paymentHeader, requestURL string) (string, error) {
 		return signPayment(priv, paymentHeader, requestURL)
-	}, nil
+	}, key, nil
 }
