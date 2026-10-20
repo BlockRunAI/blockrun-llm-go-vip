@@ -185,7 +185,7 @@ var modelCatalog = []Model{
 	{ID: "cohere/north-mini-code", Name: "Cohere North Mini Code (Free)", Provider: "cohere", Categories: []string{"chat", "coding"}, ContextWindow: 256000, MaxOutput: 16384, BillingMode: "free"},
 	{ID: "poolside/laguna-xs-2.1", Name: "Poolside Laguna XS 2.1 (Free)", Provider: "nvidia", Categories: []string{"chat", "coding"}, ContextWindow: 131072, MaxOutput: 16384, BillingMode: "free"},
 	{ID: "poolside/laguna-s-2.1", Name: "Laguna S 2.1", Provider: "poolside", Categories: []string{"chat", "coding"}, ContextWindow: 1048576, MaxOutput: 131072, BillingMode: "paid", Pricing: ModelPricing{InputPerMillion: 0.09, OutputPerMillion: 0.18}},
-	{ID: "mistral/mistral-large-4", Name: "Mistral Large 4", Provider: "mistral", Categories: []string{"chat", "reasoning", "coding", "vision"}, ContextWindow: 524288, MaxOutput: 262144, BillingMode: "paid", Pricing: ModelPricing{InputPerMillion: 0.68, OutputPerMillion: 2.09}},
+	{ID: "mistral/mistral-large-4", Name: "Mistral Large 4", Provider: "mistral", Categories: []string{"chat", "reasoning", "coding", "vision"}, ContextWindow: 524288, MaxOutput: 262144, BillingMode: "paid", Pricing: ModelPricing{InputPerMillion: 1.36, OutputPerMillion: 4.18}},
 	{ID: "nvidia/muse-glimmer-30b", Name: "Muse Glimmer 30B (Free)", Provider: "nvidia", Categories: []string{"chat", "reasoning", "coding"}, ContextWindow: 131072, MaxOutput: 16384, BillingMode: "free"},
 	{ID: "openai/gpt-image-1", Name: "GPT Image 1", Provider: "openai", Categories: []string{"image"}, BillingMode: "per_image", Pricing: ModelPricing{PerImage: 0.021}},
 	{ID: "openai/gpt-image-2", Name: "ChatGPT Images 2.0", Provider: "openai", Categories: []string{"image"}, BillingMode: "per_image", Pricing: ModelPricing{PerImage: 0.063}},
