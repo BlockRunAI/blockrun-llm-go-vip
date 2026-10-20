@@ -10,9 +10,10 @@ Unlike a re-implemented client, the constructors here return the **official
 x402 payment) and the base URL. The gateway returns the upstream provider's response
 **verbatim**, so the official SDK parses the real signals:
 
-- **Claude**: real thinking-block `Signature`, native content blocks (text / thinking /
-  tool_use), `Usage` cache tokens, native streaming — routed to Anthropic's native
-  `/v1/messages`.
+- **Claude**: `claude-opus-5.5` · `claude-sonnet-5.5` · `claude-fable-5.1` · `claude-fable-5` ·
+  `claude-opus-5` · `claude-sonnet-5` · `claude-opus-4.8` · `claude-opus-4.7` · `claude-opus-4.5` ·
+  `claude-sonnet-4.6` · `claude-sonnet-4.5` · `claude-haiku-4.5`.
+  Opus 4.7 and up use adaptive thinking — `anthropic.ThinkingConfigParamOfEnabled(N)` is honored.
 - **GPT**: native `ID` (`chatcmpl-*`), `SystemFingerprint`, honest token usage and JSON
   mode — routed to `/v1/chat/completions`.
 
@@ -126,12 +127,13 @@ You name the model; the gateway never substitutes it. Pass any current id verbat
 - **Claude**: `claude-opus-5` · `claude-sonnet-5` · `claude-opus-4.8` · `claude-opus-4.7` ·
   `claude-opus-4.5` · `claude-sonnet-4.6` · `claude-sonnet-4.5` · `claude-haiku-4.5`.
   Opus 4.7 and up use adaptive thinking — `anthropic.ThinkingConfigParamOfEnabled(N)` is honored.
-- **GPT**: `gpt-5.6-sol` · `gpt-5.6-terra` · `gpt-5.6-luna` · `gpt-5.5` · `gpt-5.4` ·
-  `gpt-5.3` · `gpt-5.2` · `gpt-4.1` · `gpt-4o` · `gpt-4o-mini`, reasoning `o3` / `o4-mini`,
+- **GPT**: `gpt-6-astra` · `gpt-6.1-sol` · `gpt-6-sol` · `gpt-6-luna` · `gpt-5.6-sol` ·
+  `gpt-5.6-terra` · `gpt-5.6-luna` (each 5.6 tier also as `-pro`) · `gpt-5.5` · `gpt-5.4` ·
+  `gpt-5.2` · `gpt-5.3-codex` · `gpt-4.1` · `gpt-4o` · `gpt-4o-mini`, reasoning `o3` / `o4-mini`,
   and more. GPT‑5.x / o-series are reasoning models — leave `MaxTokens`/`Temperature`
   unset (the gateway normalizes them); `gpt-4o` / `gpt-4o-mini` are served OpenAI-direct.
 
-The SDK also ships an 82-model catalog snapshot (chat, image, video, music, speech, and
+The SDK also ships a 115-model catalog snapshot (chat, image, video, music, speech, and
 sound effects) so callers can build a picker without a network round trip:
 
 ```go
@@ -152,8 +154,9 @@ One gotcha: use the dotted ids above. Dashed variants are accepted only as a fix
 list, and a namespaced dashed id (`anthropic/claude-sonnet-4-6`) is rejected by
 `/v1/messages` outright.
 
-The snapshot covers Claude, all GPT-5.6 tiers, Gemini, DeepSeek, Grok, Qwen, free NVIDIA,
-and media models. Use `https://blockrun.ai/api/v1/models` when your application needs the
+The snapshot (2026-10-20) covers Claude, GPT-6 and GPT-5.x, Gemini, DeepSeek, Grok, GLM,
+Kimi, MiniMax, Qwen, MiMo, Mistral, the free tier, and media models. The gateway's
+per-model `available` flag is a live health signal and is not part of the snapshot. Use `https://blockrun.ai/api/v1/models` when your application needs the
 live catalog.
 
 ## Seedance video — incl. real-person (RealFace) & AI character (Portrait)
@@ -232,8 +235,9 @@ fmt.Println(out.Data[0].URL)
 edited, _ := img.Edit(ctx, "make it night", []string{dataURI}, nil)
 ```
 
-Models: `openai/gpt-image-1` · `gpt-image-2` · `google/nano-banana` · `nano-banana-pro` ·
-`xai/grok-imagine-image` · `zai/cogview-4`. `img.ListImageModels(ctx)` lists them (free).
+Models: `openai/gpt-image-1` · `gpt-image-2` · `gpt-image-2.5-flare` · `gpt-image-2.5-sunburst` ·
+`google/nano-banana` · `nano-banana-2` · `nano-banana-pro` · `xai/grok-imagine-image` ·
+`grok-imagine-image-2.0` · `grok-imagine-image-pro` · `bytedance/seedream-5-pro` · `zai/cogview-4`. `img.ListImageModels(ctx)` lists them (free).
 
 ## Audio — speech, music, sound effects
 
