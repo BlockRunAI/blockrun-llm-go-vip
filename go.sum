@@ -1,7 +1,7 @@
 filippo.io/edwards25519 v1.0.0-rc.1 h1:m0VOOB23frXZvAOK44usCgLWvtsxIoMCTBGJZlpmGfU=
 filippo.io/edwards25519 v1.0.0-rc.1/go.mod h1:N1IkdkCkiLB6tki+MYJoSx2JTY9NUlxZE7eHn5EwJns=
-github.com/BlockRunAI/blockrun-llm-go v0.22.1 h1:k0C8E00pWmX5jutDeUiZoFsrT18+sDmEJVdLbiKiAkA=
-github.com/BlockRunAI/blockrun-llm-go v0.22.1/go.mod h1:aDi38xbZA4C4r8ysaOqKndVAcDCZBqjtu5AqmJXP61o=
+github.com/BlockRunAI/blockrun-llm-go v0.23.0 h1:voLFDYFVxBXNqBA597l8qWer/i/Z02xUl9GFVxefH24=
+github.com/BlockRunAI/blockrun-llm-go v0.23.0/go.mod h1:aDi38xbZA4C4r8ysaOqKndVAcDCZBqjtu5AqmJXP61o=
 github.com/StackExchange/wmi v1.2.1 h1:VIkavFPXSjcnS+O8yTq7NI32k0R5Aj+v39y29VYDOSA=
 github.com/StackExchange/wmi v1.2.1/go.mod h1:rcmrprowKIVzvc+NUiLncP2uuArMWLCbu9SBzvHz7e8=
 github.com/VictoriaMetrics/fastcache v1.12.2 h1:N0y9ASrJ0F6h0QaC3o6uJb3NIZ9VKLjCM7NQbSmF7WI=
