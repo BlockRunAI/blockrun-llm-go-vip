@@ -22,9 +22,35 @@ func TestModelCatalogContainsLiveSnapshot(t *testing.T) {
 		t.Fatalf("unexpected Claude Opus 5 billing mode: %q", opus.BillingMode)
 	}
 
-	for _, id := range []string{"openai/gpt-5.6-sol", "bytedance/seedance-2.0", "elevenlabs/v3"} {
+	for _, id := range []string{
+		"openai/gpt-5.6-sol", "bytedance/seedance-2.0", "elevenlabs/v3",
+		"anthropic/claude-opus-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-fable-5.1",
+		"openai/gpt-6-astra", "openai/gpt-6.1-sol", "openai/gpt-5.6-sol-pro",
+		"xai/grok-4.7", "zai/glm-5.3-flash", "qwen/qwen3.8-max", "google/gemini-3.8-flash",
+		"xiaomi/mimo-v2.5", "nvidia/llama-3.2-11b-vision", "bytedance/seedance-2.5",
+	} {
 		if _, ok := FindModel(id); !ok {
 			t.Errorf("%s is missing from the catalog", id)
+		}
+	}
+}
+
+// Ids the gateway no longer lists. The snapshot must not offer them to a model
+// picker.
+func TestModelCatalogOmitsRetiredIDs(t *testing.T) {
+	for _, id := range []string{
+		"openai/gpt-5.3",
+		"nvidia/deepseek-v4-flash",
+		"nvidia/qwen3-next-80b-a3b-instruct",
+		"nvidia/mistral-nemotron",
+		"nvidia/step-3.7-flash",
+		"nvidia/seed-oss-36b",
+		"nvidia/nemotron-nano-9b-v2",
+		"nvidia/nemotron-nano-12b-v2-vl",
+		"nvidia/nemotron-3-super-120b",
+	} {
+		if _, ok := FindModel(id); ok {
+			t.Errorf("%s is retired but still in the catalog", id)
 		}
 	}
 }
