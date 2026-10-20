@@ -28,6 +28,7 @@ func TestModelCatalogContainsLiveSnapshot(t *testing.T) {
 		"openai/gpt-6-astra", "openai/gpt-6.1-sol", "openai/gpt-5.6-sol-pro",
 		"xai/grok-4.7", "zai/glm-5.3-flash", "qwen/qwen3.8-max", "google/gemini-3.8-flash",
 		"xiaomi/mimo-v2.5", "nvidia/llama-3.2-11b-vision", "bytedance/seedance-2.5",
+		"deepseek/deepseek-v4.1-flash",
 	} {
 		if _, ok := FindModel(id); !ok {
 			t.Errorf("%s is missing from the catalog", id)

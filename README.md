@@ -133,7 +133,7 @@ You name the model; the gateway never substitutes it. Pass any current id verbat
   and more. GPT‑5.x / o-series are reasoning models — leave `MaxTokens`/`Temperature`
   unset (the gateway normalizes them); `gpt-4o` / `gpt-4o-mini` are served OpenAI-direct.
 
-The SDK also ships a 115-model catalog snapshot (chat, image, video, music, speech, and
+The SDK also ships a 116-model catalog snapshot (chat, image, video, music, speech, and
 sound effects) so callers can build a picker without a network round trip:
 
 ```go
